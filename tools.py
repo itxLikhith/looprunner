@@ -96,18 +96,27 @@ def loop_start(args, **kwargs):
     # Auto-setup cron job for set-and-forget operation
     cron_job_id = None
     try:
-        import subprocess
-        cron_expr = f"every {interval}m"
-        cron_prompt = f"Run loop_tick on loop {loop_id}"
-        proc = subprocess.run(
-            ["hermes", "cron", "create", cron_expr, cron_prompt],
-            capture_output=True, text=True, timeout=30,
-        )
-        if proc.returncode == 0:
-            # Try to extract job id from output
-            import re
-            m = re.search(r"Created job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
-            cron_job_id = m.group(1) if m else "created"
+        import subprocess, shutil, os
+        hermes_bin = shutil.which("hermes")
+        if not hermes_bin:
+            # Fallback: common install location
+            candidate = os.path.join(os.path.expanduser("~"), ".hermes", "hermes-agent", ".hermes", "bin", "hermes")
+            if os.path.exists(candidate):
+                hermes_bin = candidate
+        if hermes_bin:
+            cron_expr = f"every {interval}m"
+            cron_prompt = f"Run loop_tick on loop {loop_id}"
+            proc = subprocess.run(
+                [hermes_bin, "cron", "create", cron_expr, cron_prompt],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode == 0:
+                import re
+                m = re.search(r"Created job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
+                cron_job_id = m.group(1) if m else "created"
+            else:
+                # Store error for debugging
+                cron_job_id = None
     except Exception:
         pass
 
