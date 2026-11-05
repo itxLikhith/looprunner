@@ -121,8 +121,9 @@ def loop_start(args, **kwargs):
             else:
                 # Store error for debugging
                 cron_job_id = None
-    except Exception:
-        pass
+                state["loops"][loop_id]["_cron_error"] = (proc.stdout + proc.stderr).strip()[:500]
+    except Exception as e:
+        state["loops"][loop_id]["_cron_error"] = f"exception: {e}"
 
     state["loops"][loop_id]["cron_job_id"] = cron_job_id
     _save_state(state)
