@@ -1,0 +1,31 @@
+name: looprunner
+version: "0.1.0"
+description: Generalized set-and-forget autonomous loop runner for any repo
+author: Likhith Sai
+license: MIT
+homepage: https://github.com/likhithsai/looprunner
+tags: [automation, kanban, loop, qa, autonomous]
+requires_hermes: ">=0.22.0"
+provides_tools:
+  - loop_start
+  - loop_status
+  - loop_pause
+  - loop_resume
+  - loop_stop
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+capabilities: []
+config_schema:
+  default_profile:
+    type: str
+    default: ""
+    description: "Hermes profile to spawn workers in (empty = current)"
+  max_rounds:
+    type: int
+    default: 10
+    description: "Max loop rounds before auto-pause"
+  verify_cmd:
+    type: str
+    default: ""
+    description: "Verification command to run each round (e.g. cargo test -p gateway)"
