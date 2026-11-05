@@ -1,5 +1,5 @@
 name: looprunner
-version: "0.6.0"
+version: "0.6.1"
 description: Generalized set-and-forget autonomous loop runner for any repo
 author: Likhith Sai
 license: MIT
