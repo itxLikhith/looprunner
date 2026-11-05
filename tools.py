@@ -304,8 +304,8 @@ def loop_recommend(args, **kwargs):
         })
 
     try:
-        resp = _ctx.llm.chat(prompt)
-        text = resp if isinstance(resp, str) else str(resp)
+        resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}])
+        text = resp.text if hasattr(resp, "text") else str(resp)
         try:
             parsed = json.loads(text)
         except Exception:
