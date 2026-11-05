@@ -60,6 +60,9 @@ def register(ctx):
     def _stop(args, **kwargs):
         return tools.loop_stop(args or {}, **kwargs)
 
+    def _recommend(args, **kwargs):
+        return tools.loop_recommend(args or {}, **kwargs)
+
     ctx.register_tool(name="loop_start", toolset="looprunner",
                       schema=schemas.LOOP_START, handler=_start)
     ctx.register_tool(name="loop_tick", toolset="looprunner",
@@ -72,6 +75,11 @@ def register(ctx):
                       schema=schemas.LOOP_RESUME, handler=_resume)
     ctx.register_tool(name="loop_stop", toolset="looprunner",
                       schema=schemas.LOOP_STOP, handler=_stop)
+    ctx.register_tool(name="loop_recommend", toolset="looprunner",
+                      schema=schemas.LOOP_RECOMMEND, handler=_recommend)
+
+    # Store ctx reference for tools that need LLM access
+    tools.set_ctx(ctx)
 
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)

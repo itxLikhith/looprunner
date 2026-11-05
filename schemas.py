@@ -75,3 +75,18 @@ LOOP_STOP = {
         "required": [],
     },
 }
+
+LOOP_RECOMMEND = {
+    "name": "loop_recommend",
+    "description": (
+        "Analyze the repository and suggest 3-5 concrete improvements using the host LLM. "
+        "Returns title, why, effort (S/M/L), and a one-line fix sketch per suggestion."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id (empty = most recent)"},
+        },
+        "required": [],
+    },
+}

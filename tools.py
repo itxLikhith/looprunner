@@ -6,6 +6,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Module-level ctx reference (set by __init__ at registration)
+_ctx = None
+
+def set_ctx(ctx):
+    global _ctx
+    _ctx = ctx
+
 _STATE_DIR = Path.home() / ".hermes" / "looprunner"
 _STATE_FILE = _STATE_DIR / "loops.json"
 
@@ -234,12 +241,86 @@ def _set_status(args, new_status):
 
 
 def loop_pause(args, **kwargs):
-    return _set_status(args, 'paused')
+    return _set_status(args, "paused")
 
 
 def loop_resume(args, **kwargs):
-    return _set_status(args, 'running')
+    return _set_status(args, "running")
+
+
+def loop_recommend(args, **kwargs):
+    """Use ctx.llm to analyze the repo and suggest improvements."""
+    loop_id = (args.get("loop_id") or "").strip()
+    state = _load_state()
+    loops = state.get("loops", {})
+    if loop_id:
+        loop = loops.get(loop_id)
+    else:
+        loop = _most_recent(loops)
+    if not loop:
+        return json.dumps({"error": "no loop found"})
+
+    repo_path = loop["repo_path"]
+    import os
+    files = []
+    for root, dirs, fnames in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules", ".venv")]
+        for fn in fnames:
+            if fn.endswith((".py", ".yaml", ".yml", ".md", ".toml", ".json")):
+                rel = os.path.relpath(os.path.join(root, fn), repo_path)
+                files.append(rel)
+        if len(files) > 60:
+            break
+    file_list = chr(10).join(files[:60])
+
+    readme = ""
+    for name in ("README.md", "README.rst", "README.txt"):
+        p = os.path.join(repo_path, name)
+        if os.path.exists(p):
+            try:
+                readme = open(p, encoding="utf-8").read()[:3000]
+            except Exception:
+                pass
+            break
+
+    prompt = (
+        "You are reviewing a software repository for improvements. "
+        "Repo: " + repo_path + chr(10) +
+        "Files:" + chr(10) + file_list + chr(10) + chr(10) +
+        "README (truncated):" + chr(10) + readme + chr(10) + chr(10) +
+        "Goal: " + (loop.get("goal", "improve quality")) + chr(10) + chr(10) +
+        "Suggest 3-5 concrete, actionable improvements. "
+        "For each: title, why it matters, estimated effort (S/M/L), and a one-line fix sketch. "
+        "Return as a JSON array of objects with keys: title, why, effort, fix. "
+        "Be specific to THIS repo, not generic advice."
+    )
+
+    if _ctx is None or not hasattr(_ctx, "llm"):
+        return json.dumps({
+            "loop_id": loop["id"],
+            "error": "ctx.llm not available (plugin context not set)",
+            "prompt": prompt,
+            "note": "Run this analysis manually with the prompt above.",
+        })
+
+    try:
+        resp = _ctx.llm.chat(prompt)
+        text = resp if isinstance(resp, str) else str(resp)
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = {"raw": text}
+        return json.dumps({
+            "loop_id": loop["id"],
+            "recommendations": parsed,
+        })
+    except Exception as e:
+        return json.dumps({
+            "loop_id": loop["id"],
+            "error": f"llm call failed: {e}",
+            "prompt": prompt,
+        })
 
 
 def loop_stop(args, **kwargs):
-    return _set_status(args, 'stopped')
+    return _set_status(args, "stopped")
