@@ -106,7 +106,7 @@ def loop_start(args, **kwargs):
         if proc.returncode == 0:
             # Try to extract job id from output
             import re
-            m = re.search(r"job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
+            m = re.search(r"Created job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
             cron_job_id = m.group(1) if m else "created"
     except Exception:
         pass
