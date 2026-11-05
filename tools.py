@@ -300,33 +300,38 @@ def loop_recommend(args, **kwargs):
         "Be specific to THIS repo, not generic advice."
     )
 
-    if _ctx is None or not hasattr(_ctx, "llm"):
-        return json.dumps({
-            "loop_id": loop["id"],
-            "error": "ctx.llm not available (plugin context not set)",
-            "prompt": prompt,
-            "note": "Run this analysis manually with the prompt above.",
-        })
-
-    try:
-        resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}])
-        text = resp.text if hasattr(resp, "text") else str(resp)
-        if not text:
-            try:
-                text = getattr(resp, "content", "") or ""
-            except Exception:
-                text = str(resp)
+    # Try ctx.llm first
+    if _ctx is not None and hasattr(_ctx, "llm"):
         try:
-            parsed = json.loads(text)
+            resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}])
+            text = resp.text if hasattr(resp, "text") else str(resp)
+            if text and text.strip():
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = {"raw": text}
+                return json.dumps({
+                    "loop_id": loop["id"],
+                    "recommendations": parsed,
+                })
         except Exception:
-            parsed = {"raw": text}
-        if text.strip():
+            pass
+
+    # Fallback: use subprocess to call hermes chat
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["hermes", "chat", "-q", prompt[:2000]],
+            capture_output=True, text=True, timeout=120,
+        )
+        text = (proc.stdout + proc.stderr).strip()
+        if text:
             return json.dumps({
                 "loop_id": loop["id"],
-                "recommendations": parsed,
+                "recommendations": {"raw": text[:4000]},
             })
     except Exception:
-        pass  # fall through to prompt return
+        pass
 
     return json.dumps({
         "loop_id": loop["id"],
