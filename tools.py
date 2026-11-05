@@ -91,22 +91,45 @@ def loop_start(args, **kwargs):
     }
     err = _save_state(state)
     if err is not True:
-        return json.dumps({'error': f'state save failed: {err}'})
-    msg = 'Loop started. Run loop_tick to execute a round.'
+        return json.dumps({"error": f"state save failed: {err}"})
+
+    # Auto-setup cron job for set-and-forget operation
+    cron_job_id = None
+    try:
+        import subprocess
+        cron_expr = f"every {interval}m"
+        cron_prompt = f"Run loop_tick on loop {loop_id}"
+        proc = subprocess.run(
+            ["hermes", "cron", "create", cron_expr, cron_prompt],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            # Try to extract job id from output
+            import re
+            m = re.search(r"job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
+            cron_job_id = m.group(1) if m else "created"
+    except Exception:
+        pass
+
+    state["loops"][loop_id]["cron_job_id"] = cron_job_id
+    _save_state(state)
+
+    msg = "Loop started. Cron auto-scheduled every " + str(interval) + "m." if cron_job_id else "Loop started. Run loop_tick manually or set up cron."
     if goal:
-        msg += f' Goal: {goal}.'
+        msg += f" Goal: {goal}."
     if deadline:
-        msg += f' Deadline: {deadline} (auto-disables after).'
+        msg += f" Deadline: {deadline} (auto-disables after)."
     return json.dumps({
-        'loop_id': loop_id,
-        'status': 'running',
-        'repo_path': repo_path,
-        'verify_cmd': verify_cmd,
-        'max_rounds': max_rounds,
-        'goal': goal,
-        'deadline': deadline,
-        'interval_minutes': interval,
-        'message': msg,
+        "loop_id": loop_id,
+        "status": "running",
+        "repo_path": repo_path,
+        "verify_cmd": verify_cmd,
+        "max_rounds": max_rounds,
+        "goal": goal,
+        "deadline": deadline,
+        "interval_minutes": interval,
+        "cron_job_id": cron_job_id,
+        "message": msg,
     })
 
 
@@ -237,8 +260,18 @@ def _set_status(args, new_status):
         loop = _most_recent(loops)
     if not loop:
         return json.dumps({'error': 'no loop found'})
-    loop['status'] = new_status
-    loop['updated_at'] = _now()
+    if new_status in ("stopped", "completed"):
+        cron_id = loop.get("cron_job_id")
+        if cron_id and cron_id != "created":
+            try:
+                import subprocess
+                subprocess.run(["hermes", "cron", "pause", cron_id],
+                               capture_output=True, text=True, timeout=15)
+            except Exception:
+                pass
+
+    loop["status"] = new_status
+    loop["updated_at"] = _now()
     err = _save_state(state)
     if err is not True:
         return json.dumps({'error': f'state save failed: {err}'})
