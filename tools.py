@@ -71,7 +71,7 @@ def loop_start(args, **kwargs):
     max_rounds = args.get('max_rounds') or cfg.get('max_rounds') or 10
     goal = (args.get('goal') or '').strip()
     deadline = (args.get('deadline') or '').strip()
-    interval = args.get('interval_minutes') or 60
+    interval = int(args.get("interval_minutes") or 60)
 
     state = _load_state()
     loop_id = uuid.uuid4().hex[:12]
