@@ -99,10 +99,14 @@ def loop_start(args, **kwargs):
         import subprocess, shutil, os
         hermes_bin = shutil.which("hermes")
         if not hermes_bin:
-            # Fallback: common install location
-            candidate = os.path.join(os.path.expanduser("~"), ".hermes", "hermes-agent", ".hermes", "bin", "hermes")
-            if os.path.exists(candidate):
-                hermes_bin = candidate
+            # Fallback: common install locations
+            for candidate in [
+                os.path.join(os.path.expanduser("~"), ".hermes", "hermes-agent", ".hermes", "bin", "hermes"),
+                os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes", "hermes-agent", ".hermes", "bin", "hermes"),
+            ]:
+                if os.path.exists(candidate):
+                    hermes_bin = candidate
+                    break
         if hermes_bin:
             cron_expr = f"every {interval}m"
             cron_prompt = f"Run loop_tick on loop {loop_id}"
