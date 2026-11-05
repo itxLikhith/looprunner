@@ -306,20 +306,28 @@ def loop_recommend(args, **kwargs):
     try:
         resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}])
         text = resp.text if hasattr(resp, "text") else str(resp)
+        if not text:
+            try:
+                text = getattr(resp, "content", "") or ""
+            except Exception:
+                text = str(resp)
         try:
             parsed = json.loads(text)
         except Exception:
             parsed = {"raw": text}
-        return json.dumps({
-            "loop_id": loop["id"],
-            "recommendations": parsed,
-        })
-    except Exception as e:
-        return json.dumps({
-            "loop_id": loop["id"],
-            "error": f"llm call failed: {e}",
-            "prompt": prompt,
-        })
+        if text.strip():
+            return json.dumps({
+                "loop_id": loop["id"],
+                "recommendations": parsed,
+            })
+    except Exception:
+        pass  # fall through to prompt return
+
+    return json.dumps({
+        "loop_id": loop["id"],
+        "prompt": prompt,
+        "note": "Analyze this prompt to get improvement recommendations.",
+    })
 
 
 def loop_stop(args, **kwargs):
