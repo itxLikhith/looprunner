@@ -350,7 +350,7 @@ def loop_recommend(args, **kwargs):
     # Try ctx.llm first
     if _ctx is not None and hasattr(_ctx, "llm"):
         try:
-            resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}])
+            resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}], task="looprunner_review")
             text = resp.text if hasattr(resp, "text") else str(resp)
             if text and text.strip():
                 try:

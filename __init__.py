@@ -83,6 +83,20 @@ def register(ctx):
     ctx.register_tool(name="loop_commit", toolset="looprunner",
                       schema=schemas.LOOP_COMMIT, handler=_commit)
 
+    # Register auxiliary task for LLM access (enables ctx.llm.complete with task=)
+    try:
+        ctx.register_auxiliary_task("looprunner_review", "LoopRunner review", "code review and improvement suggestions")
+    except Exception as e:
+        logger.warning("Could not register auxiliary task: %s", e)
+
+    # Register in-session slash command
+    def _slash_handler(raw_args: str):
+        return tools.loop_status({"loop_id": (raw_args or "").strip()}, **{})
+    try:
+        ctx.register_command("looprunner", _slash_handler)
+    except Exception as e:
+        logger.warning("Could not register slash command: %s", e)
+
     # Store ctx reference for tools that need LLM access
     tools.set_ctx(ctx)
 
