@@ -181,16 +181,19 @@ def loop_tick(args, **kwargs):
         })
 
     _save_state(state)
+    branch = f"auto/round-{loop['round'] + 1}"
     return json.dumps({
-        'loop_id': loop['id'],
-        'status': 'running',
-        'round': loop['round'],
-        'result': 'FAIL',
-        'verify_cmd': verify_cmd,
-        'output': output,
-        'message': (
-            'Verify failed. Analyze the output above, apply a minimal fix in the repo, '
-            'commit to a branch, open a PR, then run loop_tick again to verify.'
+        "loop_id": loop["id"],
+        "status": "running",
+        "round": loop["round"],
+        "result": "FAIL",
+        "verify_cmd": verify_cmd,
+        "output": output,
+        "branch": branch,
+        "message": (
+            "Verify failed. Analyze the output above, apply a minimal fix in the repo, "
+            "then call loop_commit (branch='" + branch + "') to commit+PR, "
+            "then run loop_tick again to verify."
         ),
     })
 
@@ -330,6 +333,61 @@ def loop_recommend(args, **kwargs):
         "prompt": prompt,
         "note": "Analyze this prompt to get improvement recommendations.",
     })
+
+
+def loop_commit(args, **kwargs):
+    loop_id = (args.get("loop_id") or "").strip()
+    state = _load_state()
+    loops = state.get("loops", {})
+    if loop_id:
+        loop = loops.get(loop_id)
+    else:
+        loop = _most_recent(loops)
+    if not loop:
+        return json.dumps({"error": "no loop found"})
+
+    repo_path = loop["repo_path"]
+    commit_msg = (args.get("commit_message") or "looprunner: auto-fix").strip()
+    pr_title = (args.get("pr_title") or commit_msg).strip()
+    pr_body = (args.get("pr_body") or "Automated fix by LoopRunner.").strip()
+    round_n = loop["round"] + 1
+    branch = f"auto/round-{round_n}"
+
+    import subprocess
+    steps = []
+    try:
+        r = subprocess.run(f"git checkout -b {branch}", shell=True, cwd=repo_path,
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            r = subprocess.run(f"git checkout {branch}", shell=True, cwd=repo_path,
+                               capture_output=True, text=True, timeout=30)
+        steps.append({"step": "checkout", "ok": r.returncode == 0, "out": (r.stderr or r.stdout).strip()})
+
+        r = subprocess.run("git add -A", shell=True, cwd=repo_path,
+                           capture_output=True, text=True, timeout=30)
+        steps.append({"step": "add", "ok": r.returncode == 0})
+
+        r = subprocess.run(f'git commit -m "{commit_msg}"', shell=True, cwd=repo_path,
+                           capture_output=True, text=True, timeout=30)
+        steps.append({"step": "commit", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
+
+        r = subprocess.run(f"git push -u origin {branch}", shell=True, cwd=repo_path,
+                           capture_output=True, text=True, timeout=60)
+        steps.append({"step": "push", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
+
+        r = subprocess.run(f'gh pr create --title "{pr_title}" --body "{pr_body}"',
+                           shell=True, cwd=repo_path, capture_output=True, text=True, timeout=60)
+        pr_url = r.stdout.strip() if r.returncode == 0 else ""
+        steps.append({"step": "pr", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
+
+        return json.dumps({
+            "loop_id": loop["id"],
+            "branch": branch,
+            "pr_url": pr_url,
+            "steps": steps,
+        })
+    except Exception as e:
+        return json.dumps({"loop_id": loop["id"], "error": str(e), "steps": steps})
 
 
 def loop_stop(args, **kwargs):

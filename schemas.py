@@ -90,3 +90,39 @@ LOOP_RECOMMEND = {
         "required": [],
     },
 }
+
+LOOP_COMMIT = {
+    "name": "loop_commit",
+    "description": (
+        "Commit current changes to a branch and open a PR. Use after fixing a failure. "
+        "Creates branch auto/round-N, commits all changes, pushes, opens PR via gh."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id (empty = most recent)"},
+            "commit_message": {"type": "string", "description": "Commit message"},
+            "pr_title": {"type": "string", "description": "PR title"},
+            "pr_body": {"type": "string", "description": "PR body/description"},
+        },
+        "required": ["commit_message"],
+    },
+}
+
+LOOP_COMMIT = {
+    "name": "loop_commit",
+    "description": (
+        "Commit current changes to a branch and open a PR. Use after fixing a failure. "
+        "Creates branch auto/round-N, commits all changes, pushes, opens PR via gh."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id (empty = most recent)"},
+            "commit_message": {"type": "string", "description": "Commit message"},
+            "pr_title": {"type": "string", "description": "PR title"},
+            "pr_body": {"type": "string", "description": "PR body/description"},
+        },
+        "required": ["commit_message"],
+    },
+}
