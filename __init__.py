@@ -45,6 +45,9 @@ def register(ctx):
         args.setdefault("config", cfg)
         return tools.loop_start(args, **kwargs)
 
+    def _tick(args, **kwargs):
+        return tools.loop_tick(args or {}, **kwargs)
+
     def _status(args, **kwargs):
         return tools.loop_status(args or {}, **kwargs)
 
@@ -59,6 +62,8 @@ def register(ctx):
 
     ctx.register_tool(name="loop_start", toolset="looprunner",
                       schema=schemas.LOOP_START, handler=_start)
+    ctx.register_tool(name="loop_tick", toolset="looprunner",
+                      schema=schemas.LOOP_TICK, handler=_tick)
     ctx.register_tool(name="loop_status", toolset="looprunner",
                       schema=schemas.LOOP_STATUS, handler=_status)
     ctx.register_tool(name="loop_pause", toolset="looprunner",

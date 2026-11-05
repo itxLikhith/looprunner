@@ -1,5 +1,5 @@
 name: looprunner
-version: "0.1.0"
+version: "0.2.0"
 description: Generalized set-and-forget autonomous loop runner for any repo
 author: Likhith Sai
 license: MIT
@@ -8,6 +8,7 @@ tags: [automation, kanban, loop, qa, autonomous]
 requires_hermes: ">=0.22.0"
 provides_tools:
   - loop_start
+  - loop_tick
   - loop_status
   - loop_pause
   - loop_resume

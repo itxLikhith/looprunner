@@ -1,7 +1,7 @@
-"""Tool handlers — the code that runs when the LLM calls each tool."""
+"""Tool handlers."""
 
 import json
-import os
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,16 +13,16 @@ _STATE_FILE = _STATE_DIR / "loops.json"
 def _load_state():
     try:
         if _STATE_FILE.exists():
-            return json.loads(_STATE_FILE.read_text(encoding="utf-8"))
+            return json.loads(_STATE_FILE.read_text(encoding='utf-8'))
     except Exception:
         pass
-    return {"loops": {}}
+    return {'loops': {}}
 
 
 def _save_state(state):
     try:
         _STATE_DIR.mkdir(parents=True, exist_ok=True)
-        _STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        _STATE_FILE.write_text(json.dumps(state, indent=2), encoding='utf-8')
         return True
     except Exception as e:
         return str(e)
@@ -32,98 +32,214 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _most_recent(loops):
-    if not loops:
+def _most_recent(loops, active_only=False):
+    cand = [l for l in loops.values() if (l.get('status') == 'running' if active_only else True)]
+    if not cand:
         return None
-    return max(loops.values(), key=lambda x: x.get("updated_at", ""))
+    return max(cand, key=lambda x: x.get('updated_at', ''))
 
 
-def loop_start(args: dict, **kwargs) -> str:
-    repo_path = (args.get("repo_path") or "").strip()
+def _deadline_passed(loop):
+    dl = loop.get('deadline')
+    if not dl:
+        return False
+    try:
+        d = datetime.fromisoformat(dl.replace('Z', '+00:00'))
+        return datetime.now(timezone.utc) > d
+    except Exception:
+        return False
+
+
+def loop_start(args, **kwargs):
+    repo_path = (args.get('repo_path') or '').strip()
     if not repo_path:
-        return json.dumps({"error": "repo_path is required"})
+        return json.dumps({'error': 'repo_path is required'})
     if not Path(repo_path).exists():
-        return json.dumps({"error": f"repo_path does not exist: {repo_path}"})
+        return json.dumps({'error': f'repo_path does not exist: {repo_path}'})
 
-    cfg = kwargs.get("config") or {}
-    verify_cmd = (args.get("verify_cmd") or cfg.get("verify_cmd") or "").strip()
-    max_rounds = args.get("max_rounds") or cfg.get("max_rounds") or 10
+    cfg = kwargs.get('config') or {}
+    verify_cmd = (args.get('verify_cmd') or cfg.get('verify_cmd') or '').strip()
+    max_rounds = args.get('max_rounds') or cfg.get('max_rounds') or 10
+    goal = (args.get('goal') or '').strip()
+    deadline = (args.get('deadline') or '').strip()
+    interval = args.get('interval_minutes') or 60
 
     state = _load_state()
     loop_id = uuid.uuid4().hex[:12]
-    state["loops"][loop_id] = {
-        "id": loop_id,
-        "repo_path": repo_path,
-        "verify_cmd": verify_cmd,
-        "max_rounds": max_rounds,
-        "status": "running",
-        "round": 0,
-        "created_at": _now(),
-        "updated_at": _now(),
-        "history": [],
+    state['loops'][loop_id] = {
+        'id': loop_id,
+        'repo_path': repo_path,
+        'verify_cmd': verify_cmd,
+        'max_rounds': max_rounds,
+        'goal': goal,
+        'deadline': deadline,
+        'interval_minutes': interval,
+        'status': 'running',
+        'round': 0,
+        'created_at': _now(),
+        'updated_at': _now(),
+        'history': [],
     }
     err = _save_state(state)
     if err is not True:
-        return json.dumps({"error": f"state save failed: {err}"})
+        return json.dumps({'error': f'state save failed: {err}'})
+    msg = 'Loop started. Run loop_tick to execute a round.'
+    if goal:
+        msg += f' Goal: {goal}.'
+    if deadline:
+        msg += f' Deadline: {deadline} (auto-disables after).'
     return json.dumps({
-        "loop_id": loop_id,
-        "status": "running",
-        "repo_path": repo_path,
-        "verify_cmd": verify_cmd,
-        "max_rounds": max_rounds,
-        "message": "Loop started. Use loop_status to monitor.",
+        'loop_id': loop_id,
+        'status': 'running',
+        'repo_path': repo_path,
+        'verify_cmd': verify_cmd,
+        'max_rounds': max_rounds,
+        'goal': goal,
+        'deadline': deadline,
+        'interval_minutes': interval,
+        'message': msg,
     })
 
 
-def loop_status(args: dict, **kwargs) -> str:
-    loop_id = (args.get("loop_id") or "").strip()
+def loop_tick(args, **kwargs):
+    loop_id = (args.get('loop_id') or '').strip()
     state = _load_state()
-    loops = state.get("loops", {})
+    loops = state.get('loops', {})
+    if loop_id:
+        loop = loops.get(loop_id)
+    else:
+        loop = _most_recent(loops, active_only=True)
+    if not loop:
+        return json.dumps({'error': 'no active loop found'})
+    if loop.get('status') != 'running':
+        return json.dumps({'error': f"loop {loop['id']} is {loop['status']}, not running"})
+
+    if _deadline_passed(loop):
+        loop['status'] = 'completed'
+        loop['updated_at'] = _now()
+        loop['history'].append({'round': loop['round'], 'type': 'deadline', 'at': _now(),
+                                'note': 'deadline passed, auto-disabled'})
+        _save_state(state)
+        return json.dumps({'loop_id': loop['id'], 'status': 'completed',
+                           'reason': 'deadline passed', 'round': loop['round']})
+
+    if loop['round'] >= loop['max_rounds']:
+        loop['status'] = 'completed'
+        loop['updated_at'] = _now()
+        _save_state(state)
+        return json.dumps({'loop_id': loop['id'], 'status': 'completed',
+                           'reason': 'max_rounds reached', 'round': loop['round']})
+
+    verify_cmd = (loop.get('verify_cmd') or '').strip()
+    if not verify_cmd:
+        return json.dumps({'error': 'no verify_cmd configured for this loop'})
+
+    try:
+        proc = subprocess.run(
+            verify_cmd, shell=True, cwd=loop['repo_path'],
+            capture_output=True, text=True, timeout=300,
+        )
+        passed = (proc.returncode == 0)
+        output = (proc.stdout + chr(10) + proc.stderr).strip()
+        if len(output) > 4000:
+            output = output[:2000] + chr(10) + '...[truncated]...' + chr(10) + output[-2000:]
+    except subprocess.TimeoutExpired:
+        passed = False
+        output = 'verify command timed out (300s)'
+    except Exception as e:
+        passed = False
+        output = f'verify command error: {e}'
+
+    entry = {
+        'round': loop['round'] + 1,
+        'type': 'verify',
+        'at': _now(),
+        'passed': passed,
+        'output': output,
+    }
+    loop['history'].append(entry)
+    loop['updated_at'] = _now()
+
+    if passed:
+        loop['round'] += 1
+        _save_state(state)
+        return json.dumps({
+            'loop_id': loop['id'],
+            'status': 'running',
+            'round': loop['round'],
+            'result': 'PASS',
+            'message': f"Round {loop['round']} passed. Run loop_tick for next round.",
+        })
+
+    _save_state(state)
+    return json.dumps({
+        'loop_id': loop['id'],
+        'status': 'running',
+        'round': loop['round'],
+        'result': 'FAIL',
+        'verify_cmd': verify_cmd,
+        'output': output,
+        'message': (
+            'Verify failed. Analyze the output above, apply a minimal fix in the repo, '
+            'commit to a branch, open a PR, then run loop_tick again to verify.'
+        ),
+    })
+
+
+def loop_status(args, **kwargs):
+    loop_id = (args.get('loop_id') or '').strip()
+    state = _load_state()
+    loops = state.get('loops', {})
     if loop_id:
         loop = loops.get(loop_id)
         if not loop:
-            return json.dumps({"error": f"unknown loop_id: {loop_id}"})
+            return json.dumps({'error': f'unknown loop_id: {loop_id}'})
     else:
         loop = _most_recent(loops)
         if not loop:
-            return json.dumps({"error": "no loops found"})
+            return json.dumps({'error': 'no loops found'})
     return json.dumps({
-        "loop_id": loop["id"],
-        "status": loop["status"],
-        "repo_path": loop["repo_path"],
-        "round": loop["round"],
-        "max_rounds": loop["max_rounds"],
-        "verify_cmd": loop["verify_cmd"],
-        "last_result": loop["history"][-1] if loop["history"] else None,
-        "rounds_completed": len(loop["history"]),
+        'loop_id': loop['id'],
+        'status': loop['status'],
+        'repo_path': loop['repo_path'],
+        'round': loop['round'],
+        'max_rounds': loop['max_rounds'],
+        'verify_cmd': loop['verify_cmd'],
+        'goal': loop.get('goal', ''),
+        'deadline': loop.get('deadline', ''),
+        'interval_minutes': loop.get('interval_minutes', 60),
+        'last_result': loop['history'][-1] if loop['history'] else None,
+        'rounds_completed': len([h for h in loop['history'] if h.get('type') == 'verify']),
+        'passes': len([h for h in loop['history'] if h.get('passed')]),
+        'fails': len([h for h in loop['history'] if h.get('passed') is False]),
     })
 
 
 def _set_status(args, new_status):
-    loop_id = (args.get("loop_id") or "").strip()
+    loop_id = (args.get('loop_id') or '').strip()
     state = _load_state()
-    loops = state.get("loops", {})
+    loops = state.get('loops', {})
     if loop_id:
         loop = loops.get(loop_id)
     else:
         loop = _most_recent(loops)
     if not loop:
-        return json.dumps({"error": "no loop found"})
-    loop["status"] = new_status
-    loop["updated_at"] = _now()
+        return json.dumps({'error': 'no loop found'})
+    loop['status'] = new_status
+    loop['updated_at'] = _now()
     err = _save_state(state)
     if err is not True:
-        return json.dumps({"error": f"state save failed: {err}"})
-    return json.dumps({"loop_id": loop["id"], "status": new_status})
+        return json.dumps({'error': f'state save failed: {err}'})
+    return json.dumps({'loop_id': loop['id'], 'status': new_status})
 
 
-def loop_pause(args: dict, **kwargs) -> str:
-    return _set_status(args, "paused")
+def loop_pause(args, **kwargs):
+    return _set_status(args, 'paused')
 
 
-def loop_resume(args: dict, **kwargs) -> str:
-    return _set_status(args, "running")
+def loop_resume(args, **kwargs):
+    return _set_status(args, 'running')
 
 
-def loop_stop(args: dict, **kwargs) -> str:
-    return _set_status(args, "stopped")
+def loop_stop(args, **kwargs):
+    return _set_status(args, 'stopped')
