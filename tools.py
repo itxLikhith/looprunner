@@ -319,21 +319,21 @@ def loop_recommend(args, **kwargs):
     import os
     files = []
     for root, dirs, fnames in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules", ".venv")]
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules", ".venv", ".venv-real")]
         for fn in fnames:
-            if fn.endswith((".py", ".yaml", ".yml", ".md", ".toml", ".json")):
+            if fn.endswith(( ".py", ".yaml", ".yml", ".md", ".toml")):
                 rel = os.path.relpath(os.path.join(root, fn), repo_path)
                 files.append(rel)
-        if len(files) > 60:
+        if len(files) > 30:
             break
-    file_list = chr(10).join(files[:60])
+    file_list = chr(10).join(files[:30])
 
     readme = ""
     for name in ("README.md", "README.rst", "README.txt"):
         p = os.path.join(repo_path, name)
         if os.path.exists(p):
             try:
-                readme = open(p, encoding="utf-8").read()[:3000]
+                readme = open(p, encoding="utf-8").read()[:1500]
             except Exception:
                 pass
             break
@@ -366,7 +366,7 @@ def loop_recommend(args, **kwargs):
             hermes_bin = "hermes"
         proc = subprocess.run(
             [hermes_bin, "chat", "-q", prompt[:2000]],
-            capture_output=True, text=True, timeout=180, cwd=repo_path,
+            capture_output=True, text=True, timeout=300, cwd=repo_path,
         )
         text = (proc.stdout + proc.stderr).strip()
         if text:
