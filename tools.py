@@ -350,24 +350,7 @@ def loop_recommend(args, **kwargs):
         "Be specific to THIS repo, not generic advice."
     )
 
-    # Try ctx.llm first
-    if _ctx is not None and hasattr(_ctx, "llm"):
-        try:
-            resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}], task="looprunner_review")
-            text = resp.text if hasattr(resp, "text") else str(resp)
-            if text and text.strip() and text.strip() not in ("{}", "null", "[]"):
-                try:
-                    parsed = json.loads(text)
-                except Exception:
-                    parsed = {"raw": text}
-                return json.dumps({
-                    "loop_id": loop["id"],
-                    "recommendations": parsed,
-                })
-        except Exception:
-            pass
-
-    # Fallback: use subprocess to call hermes chat
+    # Use subprocess to call hermes chat (ctx.llm path returns empty/broken)
     try:
         import shutil
         hermes_bin = shutil.which("hermes")
