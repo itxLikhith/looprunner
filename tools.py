@@ -71,7 +71,11 @@ def loop_start(args, **kwargs):
     max_rounds = args.get('max_rounds') or cfg.get('max_rounds') or 10
     goal = (args.get('goal') or '').strip()
     deadline = (args.get('deadline') or '').strip()
-    interval = int(args.get("interval_minutes") or 60)
+    interval_raw = args.get("interval_minutes") or cfg.get("interval_minutes") or 60
+    try:
+        interval = int(str(interval_raw).replace("m", "").replace("min", "").strip())
+    except (ValueError, TypeError):
+        interval = 60
 
     state = _load_state()
     loop_id = uuid.uuid4().hex[:12]
@@ -180,10 +184,11 @@ def loop_tick(args, **kwargs):
     if not verify_cmd:
         return json.dumps({'error': 'no verify_cmd configured for this loop'})
 
+    timeout = int(loop.get('verify_timeout', 300))
     try:
         proc = subprocess.run(
             verify_cmd, shell=True, cwd=loop['repo_path'],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=timeout,
         )
         passed = (proc.returncode == 0)
         output = (proc.stdout + chr(10) + proc.stderr).strip()
@@ -191,7 +196,7 @@ def loop_tick(args, **kwargs):
             output = output[:2000] + chr(10) + '...[truncated]...' + chr(10) + output[-2000:]
     except subprocess.TimeoutExpired:
         passed = False
-        output = 'verify command timed out (300s)'
+        output = f'verify command timed out ({timeout}s)'
     except Exception as e:
         passed = False
         output = f'verify command error: {e}'
@@ -281,9 +286,19 @@ def _set_status(args, new_status):
         cron_id = loop.get("cron_job_id")
         if cron_id and cron_id != "created":
             try:
-                import subprocess
-                subprocess.run(["hermes", "cron", "pause", cron_id],
-                               capture_output=True, text=True, timeout=15)
+                import subprocess, shutil, os
+                hermes_bin = shutil.which("hermes")
+                if not hermes_bin:
+                    for candidate in [
+                        os.path.join(os.path.expanduser("~"), ".hermes", "hermes-agent", ".hermes", "bin", "hermes"),
+                        os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes", "hermes-agent", ".hermes", "bin", "hermes"),
+                    ]:
+                        if os.path.exists(candidate):
+                            hermes_bin = candidate
+                            break
+                if hermes_bin:
+                    subprocess.run([hermes_bin, "cron", "pause", cron_id],
+                                   capture_output=True, text=True, timeout=15)
             except Exception:
                 pass
 
@@ -396,6 +411,11 @@ def loop_commit(args, **kwargs):
         return json.dumps({"error": "no loop found"})
 
     repo_path = loop["repo_path"]
+    # Validate it's actually a git repo
+    import os
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        return json.dumps({"error": f"not a git repository: {repo_path}"})
+
     commit_msg = (args.get("commit_message") or "looprunner: auto-fix").strip()
     pr_title = (args.get("pr_title") or commit_msg).strip()
     pr_body = (args.get("pr_body") or "Automated fix by LoopRunner.").strip()
@@ -405,27 +425,28 @@ def loop_commit(args, **kwargs):
     import subprocess
     steps = []
     try:
-        r = subprocess.run(f"git checkout -b {branch}", shell=True, cwd=repo_path,
+        # checkout branch (safe: branch is constructed from integer round_n)
+        r = subprocess.run(["git", "checkout", "-b", branch], cwd=repo_path,
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            r = subprocess.run(f"git checkout {branch}", shell=True, cwd=repo_path,
+            r = subprocess.run(["git", "checkout", branch], cwd=repo_path,
                                capture_output=True, text=True, timeout=30)
         steps.append({"step": "checkout", "ok": r.returncode == 0, "out": (r.stderr or r.stdout).strip()})
 
-        r = subprocess.run("git add -A", shell=True, cwd=repo_path,
+        r = subprocess.run(["git", "add", "-A"], cwd=repo_path,
                            capture_output=True, text=True, timeout=30)
         steps.append({"step": "add", "ok": r.returncode == 0})
 
-        r = subprocess.run(f'git commit -m "{commit_msg}"', shell=True, cwd=repo_path,
+        r = subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_path,
                            capture_output=True, text=True, timeout=30)
         steps.append({"step": "commit", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
 
-        r = subprocess.run(f"git push -u origin {branch}", shell=True, cwd=repo_path,
+        r = subprocess.run(["git", "push", "-u", "origin", branch], cwd=repo_path,
                            capture_output=True, text=True, timeout=60)
         steps.append({"step": "push", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
 
-        r = subprocess.run(f'gh pr create --title "{pr_title}" --body "{pr_body}"',
-                           shell=True, cwd=repo_path, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(["gh", "pr", "create", "--title", pr_title, "--body", pr_body],
+                           cwd=repo_path, capture_output=True, text=True, timeout=60)
         pr_url = r.stdout.strip() if r.returncode == 0 else ""
         steps.append({"step": "pr", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
 
