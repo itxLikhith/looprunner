@@ -76,6 +76,9 @@ def loop_start(args, **kwargs):
         interval = int(str(interval_raw).replace("m", "").replace("min", "").strip())
     except (ValueError, TypeError):
         interval = 60
+    branch_guard = args.get('branch_guard', cfg.get('branch_guard', True))
+    auto_recommend = args.get('auto_recommend', cfg.get('auto_recommend', False))
+    verify_timeout = int(args.get('verify_timeout') or cfg.get('verify_timeout') or 300)
 
     state = _load_state()
     loop_id = uuid.uuid4().hex[:12]
@@ -87,6 +90,9 @@ def loop_start(args, **kwargs):
         'goal': goal,
         'deadline': deadline,
         'interval_minutes': interval,
+        'branch_guard': branch_guard,
+        'auto_recommend': auto_recommend,
+        'verify_timeout': verify_timeout,
         'status': 'running',
         'round': 0,
         'created_at': _now(),
@@ -146,6 +152,9 @@ def loop_start(args, **kwargs):
         "goal": goal,
         "deadline": deadline,
         "interval_minutes": interval,
+        "branch_guard": branch_guard,
+        "auto_recommend": auto_recommend,
+        "verify_timeout": verify_timeout,
         "cron_job_id": cron_job_id,
         "message": msg,
     })
@@ -184,6 +193,27 @@ def loop_tick(args, **kwargs):
     if not verify_cmd:
         return json.dumps({'error': 'no verify_cmd configured for this loop'})
 
+    # Branch guard: warn if on main/master, auto-create working branch
+    branch_guard = loop.get('branch_guard', True)
+    current_branch = None
+    try:
+        import subprocess
+        r = subprocess.run(['git', 'branch', '--show-current'], cwd=loop['repo_path'],
+                           capture_output=True, text=True, timeout=10)
+        current_branch = r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        pass
+
+    if branch_guard and current_branch in ('main', 'master'):
+        # Auto-create a working branch
+        work_branch = f"looprunner/work-{loop['round'] + 1}"
+        try:
+            subprocess.run(['git', 'checkout', '-b', work_branch], cwd=loop['repo_path'],
+                           capture_output=True, text=True, timeout=10)
+            current_branch = work_branch
+        except Exception:
+            pass
+
     timeout = int(loop.get('verify_timeout', 300))
     try:
         proc = subprocess.run(
@@ -214,13 +244,18 @@ def loop_tick(args, **kwargs):
     if passed:
         loop['round'] += 1
         _save_state(state)
-        return json.dumps({
+        resp = {
             'loop_id': loop['id'],
             'status': 'running',
             'round': loop['round'],
             'result': 'PASS',
+            'branch': current_branch,
             'message': f"Round {loop['round']} passed. Run loop_tick for next round.",
-        })
+        }
+        if loop.get('auto_recommend', False):
+            resp['recommend_next'] = True
+            resp['message'] += " Consider running loop_recommend to find next improvements."
+        return json.dumps(resp)
 
     _save_state(state)
     branch = f"auto/round-{loop['round'] + 1}"
@@ -265,6 +300,9 @@ def loop_status(args, **kwargs):
         'goal': loop.get('goal', ''),
         'deadline': loop.get('deadline', ''),
         'interval_minutes': loop.get('interval_minutes', 60),
+        'branch_guard': loop.get('branch_guard', True),
+        'auto_recommend': loop.get('auto_recommend', False),
+        'verify_timeout': loop.get('verify_timeout', 300),
         'last_result': loop['history'][-1] if loop['history'] else None,
         'rounds_completed': len([h for h in loop['history'] if h.get('type') == 'verify']),
         'passes': len([h for h in loop['history'] if h.get('passed')]),
