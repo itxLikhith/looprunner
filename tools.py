@@ -355,7 +355,7 @@ def loop_recommend(args, **kwargs):
         try:
             resp = _ctx.llm.complete(messages=[{"role": "user", "content": prompt}], task="looprunner_review")
             text = resp.text if hasattr(resp, "text") else str(resp)
-            if text and text.strip():
+            if text and text.strip() and text.strip() not in ("{}", "null", "[]"):
                 try:
                     parsed = json.loads(text)
                 except Exception:
