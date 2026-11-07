@@ -228,9 +228,12 @@ def loop_tick(args, **kwargs):
         "output": output,
         "branch": branch,
         "message": (
-            "Verify failed. Analyze the output above, apply a minimal fix in the repo, "
-            "then call loop_commit (branch='" + branch + "') to commit+PR, "
-            "then run loop_tick again to verify."
+            "Verify failed. Analyze the output above, apply a minimal fix in the repo. "
+            "IMPORTANT: Do NOT run 'git commit' or 'git push' directly. "
+            "You MUST use the loop_commit tool with branch='" + branch + "' to commit+open a PR. "
+            "loop_commit creates a branch, commits, pushes, and opens a PR via gh. "
+            "After loop_commit returns a PR URL, run loop_tick again to verify the fix. "
+            "Direct commits to master/main are NOT allowed — always use loop_commit."
         ),
     })
 
