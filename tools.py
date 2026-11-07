@@ -369,10 +369,21 @@ def loop_recommend(args, **kwargs):
 
     # Fallback: use subprocess to call hermes chat
     try:
-        import subprocess
+        import shutil
+        hermes_bin = shutil.which("hermes")
+        if not hermes_bin:
+            for fb in (
+                os.path.expanduser("~/.hermes/hermes-agent/.hermes/bin/hermes"),
+                os.path.expanduser("~/AppData/Local/hermes/hermes-agent/.hermes/bin/hermes"),
+            ):
+                if os.path.isfile(fb):
+                    hermes_bin = fb
+                    break
+        if not hermes_bin:
+            hermes_bin = "hermes"
         proc = subprocess.run(
-            ["hermes", "chat", "-q", prompt[:2000]],
-            capture_output=True, text=True, timeout=120,
+            [hermes_bin, "chat", "-q", prompt[:2000]],
+            capture_output=True, text=True, timeout=180, cwd=repo_path,
         )
         text = (proc.stdout + proc.stderr).strip()
         if text:
@@ -380,7 +391,7 @@ def loop_recommend(args, **kwargs):
                 "loop_id": loop["id"],
                 "recommendations": {"raw": text[:4000]},
             })
-    except Exception:
+    except Exception as e:
         pass
 
     return json.dumps({
