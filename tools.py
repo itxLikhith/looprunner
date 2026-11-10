@@ -933,13 +933,50 @@ def loop_stop(args, **kwargs):
     return _set_status(args, "stopped")
 
 
+def _push_and_pr(repo_path, branch, pr_title, pr_body):
+    """Push ``branch`` and open a PR. Returns (pr_url, steps).
+
+    ``--head`` is passed explicitly: after a fresh ``git push -u`` gh sometimes
+    cannot resolve the head branch and aborts with "you must first push the
+    current branch to a remote", even though the push just succeeded.
+    """
+    git = _git_path()
+    steps = []
+    rc, out = _run([git, "push", "-u", "origin", branch], cwd=repo_path, timeout=90)
+    steps.append({"step": "push", "ok": rc == 0, "out": out.strip()[:300]})
+    if rc != 0:
+        return "", steps
+    pr_url = ""
+    rc, out = _run([_gh_path(), "pr", "create", "--title", pr_title, "--body", pr_body,
+                    "--head", branch], cwd=repo_path, timeout=60)
+    steps.append({"step": "pr", "ok": rc == 0, "out": out.strip()[:300]})
+    if rc == 0:
+        pr_url = out.strip().splitlines()[-1].strip()
+    return pr_url, steps
+
+
+def _record_pr(loop, pr_url, branch):
+    prs = loop.get("prs") or []
+    if pr_url and not any(p.get("url") == pr_url for p in prs):
+        prs.append({
+            "url": pr_url, "branch": branch,
+            "round": loop.get("round", 0),
+            "attempt": loop.get("attempts", 0),
+            "opened_at": _now(), "state": "open",
+        })
+    loop["prs"] = prs
+    loop["updated_at"] = _now()
+
+
 def loop_commit(args, **kwargs):
     """Commit current changes to a loop branch and open a PR.
 
     Safety properties:
     * refuses to commit when the work tree is clean (no empty commits);
     * reports the diff stat instead of writing anything when ``dry_run`` is set;
-    * reuses the loop's existing working branch instead of nesting a new one.
+    * reuses the loop's existing working branch instead of nesting a new one;
+    * retrying after a failed push pushes the existing commits instead of
+      refusing on a clean tree.
     """
     loop_id = (args.get("loop_id") or "").strip()
     dry_run = bool(args.get("dry_run", False))
@@ -969,6 +1006,32 @@ def loop_commit(args, **kwargs):
         changed = [l for l in status_out.splitlines()
                    if l.strip() and not _is_artifact(l)]
         if not changed:
+            # Clean tree. Two legitimate cases:
+            #   * nothing was ever changed -> tell the caller;
+            #   * an earlier attempt committed but the push failed -> retry the
+            #     push, otherwise the loop is stuck with no way forward.
+            current0 = _current_branch(repo_path)
+            if _is_loop_branch(current0):
+                rc, ahead = _run([git, "log", "@{u}..HEAD", "--oneline"],
+                                 cwd=repo_path, timeout=20)
+                if rc == 0 and ahead.strip():
+                    prs0 = loop.get("prs") or []
+                    if not any(p.get("branch") == current0 for p in prs0):
+                        pr_url0, steps0 = _push_and_pr(repo_path, current0, pr_title, pr_body)
+                        _record_pr(loop, pr_url0, current0)
+                        _save_state(state)
+                        return json.dumps({
+                            "loop_id": loop["id"], "committed": False,
+                            "pushed_retry": True, "branch": current0,
+                            "pr_url": pr_url0, "steps": steps0,
+                            "message": (
+                                "Work tree was clean; pushed the existing commit(s) to "
+                                "%s and opened %s." % (current0, pr_url0)
+                                if pr_url0 else
+                                "Work tree was clean; pushed existing commits to %s; "
+                                "PR creation failed." % current0
+                            ),
+                        })
             return json.dumps({
                 "loop_id": loop["id"], "committed": False,
                 "reason": "nothing to commit -- work tree is clean",
@@ -1009,32 +1072,16 @@ def loop_commit(args, **kwargs):
             return json.dumps({"loop_id": loop["id"], "committed": False,
                                "branch": branch, "steps": steps})
 
-        rc, out = _run([git, "push", "-u", "origin", branch], cwd=repo_path, timeout=90)
-        steps.append({"step": "push", "ok": rc == 0, "out": out.strip()[:300]})
-        if rc != 0:
+        pr_url, push_steps = _push_and_pr(repo_path, branch, pr_title, pr_body)
+        steps.extend(push_steps)
+        if not push_steps[0].get("ok"):
             return json.dumps({
                 "loop_id": loop["id"], "committed": True, "branch": branch,
                 "pushed": False, "steps": steps,
                 "message": "Committed locally but the push failed -- check auth and re-run loop_commit.",
             })
 
-        pr_url = ""
-        rc, out = _run([_gh_path(), "pr", "create", "--title", pr_title, "--body", pr_body],
-                       cwd=repo_path, timeout=60)
-        steps.append({"step": "pr", "ok": rc == 0, "out": out.strip()[:300]})
-        if rc == 0:
-            pr_url = out.strip().splitlines()[-1].strip()
-
-        prs = loop.get("prs") or []
-        if pr_url:
-            prs.append({
-                "url": pr_url, "branch": branch,
-                "round": loop.get("round", 0),
-                "attempt": loop.get("attempts", 0),
-                "opened_at": _now(), "state": "open",
-            })
-        loop["prs"] = prs
-        loop["updated_at"] = _now()
+        _record_pr(loop, pr_url, branch)
         _save_state(state)
 
         return json.dumps({
@@ -1080,11 +1127,18 @@ def loop_revert(args, **kwargs):
         else:
             steps.append({"step": "pr_close", "ok": True, "out": out.strip()[:300]})
 
-        rc, out = _run([git, "checkout", "-"], cwd=repo_path, timeout=30)
-        steps.append({"step": "checkout_back", "ok": rc == 0, "out": out.strip()[:200]})
-        rc, out = _run([git, "branch", "-D", last.get("branch", "")],
-                       cwd=repo_path, timeout=30)
-        steps.append({"step": "branch_delete", "ok": rc == 0, "out": out.strip()[:200]})
+        # gh's --delete-branch may already have switched branch and removed it.
+        rc, _ = _run([git, "rev-parse", "--verify", "--quiet", "refs/heads/%s" % last.get("branch", "")],
+                     cwd=repo_path, timeout=20)
+        if rc == 0:
+            rc, out = _run([git, "checkout", "-"], cwd=repo_path, timeout=30)
+            steps.append({"step": "checkout_back", "ok": rc == 0, "out": out.strip()[:200]})
+            rc, out = _run([git, "branch", "-D", last.get("branch", "")],
+                           cwd=repo_path, timeout=30)
+            steps.append({"step": "branch_delete", "ok": rc == 0, "out": out.strip()[:200]})
+        else:
+            steps.append({"step": "branch_delete", "ok": True,
+                          "out": "branch already removed"})
 
         last["state"] = "closed"
         last["closed_at"] = _now()
@@ -1186,6 +1240,23 @@ _GIT_WRITE_RE = re.compile(
 _PLACEHOLDER_RE = re.compile(r"^(?:placeholder|n/?a|todo|tbd|none|unknown|\.{3}|-)$", re.I)
 
 
+def _cmd_targets_repo(cmd, repo_path):
+    """True when a shell command plausibly operates on ``repo_path``.
+
+    The gate exists to stop an agent from bypassing ``loop_commit`` *in the loop's
+    own repository*; a commit in some unrelated checkout is none of its business.
+    """
+    if not cmd or not repo_path:
+        return False
+    if repo_path.replace("\\", "/") in cmd.replace("\\", "/"):
+        return True
+    try:
+        Path.cwd().resolve().relative_to(Path(repo_path).resolve())
+        return True
+    except Exception:
+        return False
+
+
 def guard_tool_call(tool_name, args):
     """Veto unsafe tool calls while a loop is running.
 
@@ -1218,7 +1289,9 @@ def guard_tool_call(tool_name, args):
             return None
         for loop in active:
             branch = _current_branch(loop["repo_path"])
-            if branch in ("main", "master") or _is_loop_branch(branch):
+            if not (branch in ("main", "master") or _is_loop_branch(branch)):
+                continue
+            if _cmd_targets_repo(cmd, loop["repo_path"]):
                 return {
                     "action": "block",
                     "message": ("Direct git write blocked: loop %s is active on %s. "

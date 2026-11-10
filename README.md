@@ -1,36 +1,75 @@
 # LoopRunner
 
-Generalized set-and-forget autonomous QA loop runner for Hermes Agent.
+Set-and-forget autonomous QA loop runner for Hermes Agent.
 
 ## What it does
 
-LoopRunner turns Hermes into a continuous autonomous QA agent for any repository: it runs your verify command each round, analyzes failures, applies minimal fixes on a branch, opens PRs, and repeats — all without manual intervention.
+LoopRunner turns Hermes into a continuous autonomous QA agent for any repository: it runs
+your verify command each round, diagnoses failures with the host LLM, applies a minimal fix
+on a branch, opens a PR, and repeats — all without manual intervention.
 
-## Disclosure (rule 13)
+It is built to **stop itself**. Two budgets bound a loop, and a failure fingerprint detects
+when retrying is pointless:
 
-- Reads/writes state under `~/.hermes/looprunner/` only.
-- Spawns shell commands (your configured verify command) via the terminal tool.
-- Creates git branches and opens PRs via `gh` CLI when configured.
-- No network calls to third-party services beyond git/gh.
-- No credentials stored; relies on Hermes's existing git/gh auth.
-- Long-running background process per active loop.
+- `max_rounds` bounds **passes**.
+- `max_attempts` bounds **total verify runs** — a loop that keeps failing terminates instead
+  of retrying forever.
+- Every failure is reduced to a normalized *signature* (numbers, hashes and absolute paths
+  masked). The same signature recurring `stall_threshold` times marks the loop `stalled` and
+  pauses its own cron, so the agent escalates instead of spinning.
+
+## Tools
+
+| Tool | Purpose |
+| --- | --- |
+| `loop_start` | Start a loop; auto-creates the cron job |
+| `loop_tick` | Run one verify round; records pass/fail, duration, signature |
+| `loop_verify` | Dry-run the verify command without recording a round |
+| `loop_analyze` | Structured LLM diagnosis: root cause, failing tests, files, fix, confidence |
+| `loop_commit` | Branch + commit + push + PR (refuses clean trees; `dry_run` supported) |
+| `loop_revert` | Close the last PR, delete its branch, return to the previous branch |
+| `loop_status` | Round/attempt counts, budgets, signature, PRs, elapsed time |
+| `loop_history` | Full round history |
+| `loop_recommend` | LLM suggestions for the repository |
+| `loop_pause` / `loop_resume` / `loop_stop` | Control the loop and its cron |
 
 ## Install
 
 ```
-hermes plugins install /path/to/looprunner-plugin
+hermes plugins install /path/to/looprunner
 hermes plugins enable looprunner
 ```
 
 ## Usage
 
 ```
-loop_start(repo_path="/path/to/repo", verify_cmd="cargo test")
-loop_status()
-loop_pause()
-loop_resume()
-loop_stop()
+loop_start(repo_path="/path/to/repo", verify_cmd="cargo test",
+           max_rounds=5, max_attempts=10, stall_threshold=3)
+loop_tick()
+loop_analyze()      # after a FAIL
+loop_verify()       # confirm the fix without recording a round
+loop_commit()       # branch + PR
+loop_tick()         # confirm the pass
 ```
+
+## Safety
+
+- `loop_commit` is the only commit path. A `pre_tool_call` gate blocks direct
+  `git commit`/`git push` while a loop is active on `main`/`master` or a loop branch.
+- Generated artifacts (`__pycache__`, `*.pyc`, `node_modules`, `dist`, `build`, `.venv`, …)
+  are excluded from both the diff gate and the commit.
+- `loop_commit` refuses to run on a clean work tree — no empty commits.
+- State lives in the plugin data directory, so it survives `hermes plugins update`.
+- Per-loop file locking prevents concurrent cron ticks from corrupting state.
+
+## Disclosure (rule 13)
+
+- Reads/writes state under the plugin data directory (`plugin-data/looprunner/`) only.
+- Spawns shell commands (your configured verify command) with the repository as cwd.
+- Creates git branches and opens PRs via the `gh` CLI.
+- No network calls to third-party services beyond git/gh.
+- No credentials stored; relies on Hermes's existing git/gh auth.
+- Long-running background process per active loop.
 
 ## License
 
