@@ -73,6 +73,10 @@ def register(ctx):
         "loop_recommend": _wrap("loop_recommend"),
         "loop_commit": _wrap("loop_commit"),
         "loop_revert": _wrap("loop_revert"),
+        "loop_watch": _wrap("loop_watch"),
+        "loop_scan_issues": _wrap("loop_scan_issues"),
+        "loop_security": _wrap("loop_security"),
+        "loop_checkpoint": _wrap("loop_checkpoint"),
     }
 
     _SCHEMAS = {
@@ -88,6 +92,10 @@ def register(ctx):
         "loop_recommend": schemas.LOOP_RECOMMEND,
         "loop_commit": schemas.LOOP_COMMIT,
         "loop_revert": schemas.LOOP_REVERT,
+        "loop_watch": schemas.LOOP_WATCH,
+        "loop_scan_issues": schemas.LOOP_SCAN_ISSUES,
+        "loop_security": schemas.LOOP_SECURITY,
+        "loop_checkpoint": schemas.LOOP_CHECKPOINT,
     }
 
     for name, schema in _SCHEMAS.items():
@@ -129,4 +137,4 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register bundled skill: %s", e)
 
-    logger.info("LoopRunner plugin loaded (12 tools, 3 hooks)")
+    logger.info("LoopRunner plugin loaded (16 tools, 3 hooks)")

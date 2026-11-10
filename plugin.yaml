@@ -1,13 +1,15 @@
 name: looprunner
-version: "0.8.0"
+version: "0.9.0"
 description: >-
   Set-and-forget autonomous QA loop runner for any repo: runs your verify command,
   diagnoses failures with the host LLM, fixes the source on a branch, opens a PR,
-  and stops itself when it stalls or runs out of budget.
+  and stops itself when it stalls or runs out of budget. Can watch a repository's
+  issues and dispatch goal-mode kanban cards, gate PRs on a security review, and
+  checkpoint a stalled stage for a later retry.
 author: Likhith Sai
 license: MIT
 homepage: https://github.com/itxLikhith/looprunner
-tags: [automation, kanban, loop, qa, autonomous, testing, ci]
+tags: [automation, kanban, loop, qa, autonomous, testing, ci, security, issues]
 requires_hermes: ">=0.22.0"
 provides_tools:
   - loop_start
@@ -16,9 +18,13 @@ provides_tools:
   - loop_status
   - loop_history
   - loop_analyze
-  - loop_recommend
   - loop_commit
   - loop_revert
+  - loop_watch
+  - loop_scan_issues
+  - loop_security
+  - loop_checkpoint
+  - loop_recommend
   - loop_pause
   - loop_resume
   - loop_stop
@@ -44,6 +50,18 @@ config_schema:
     type: int
     default: 3
     description: "Same failure signature repeats before the loop stalls itself"
+  goal_cmd:
+    type: str
+    default: ""
+    description: "Acceptance command for the goal; the loop only completes when it exits 0"
+  checkpoint_on_stall:
+    type: bool
+    default: true
+    description: "Snapshot the stage, dispatch a resume card and schedule a retry cron on stall"
+  security_gate:
+    type: bool
+    default: false
+    description: "Security-review the diff before opening a PR; refuse on critical/high findings"
   verify_cmd:
     type: str
     default: ""
@@ -56,3 +74,11 @@ config_schema:
     type: bool
     default: true
     description: "Block direct git commit/push while a loop is active on main/master"
+  assignee:
+    type: str
+    default: ""
+    description: "Kanban profile to assign dispatched cards to"
+  goal_max_turns:
+    type: int
+    default: 20
+    description: "Turn budget for goal-mode kanban cards"

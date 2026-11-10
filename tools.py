@@ -125,6 +125,15 @@ def _migrate(raw):
         loop.setdefault("branch_guard", True)
         loop.setdefault("verify_timeout", 300)
         loop.setdefault("cron_job_id", None)
+        loop.setdefault("goal_cmd", "")
+        loop.setdefault("checkpoint_on_stall", True)
+        loop.setdefault("security_gate", False)
+        loop.setdefault("mode", "fix")
+        loop.setdefault("assignee", None)
+        loop.setdefault("labels", [])
+        loop.setdefault("goal_max_turns", 20)
+        loop.setdefault("seen_issues", {})
+        loop.setdefault("watch_cards", [])
         for entry in loop.get("history", []):
             entry.setdefault("attempt", entry.get("round", 0))
             entry.setdefault("duration_s", None)
@@ -425,6 +434,15 @@ def loop_start(args, **kwargs):
     auto_fix = args.get("auto_fix", cfg.get("auto_fix", False))
     strict_git_guard = args.get("strict_git_guard", cfg.get("strict_git_guard", True))
     verify_timeout = int(args.get("verify_timeout") or cfg.get("verify_timeout") or 300)
+    goal_cmd = (args.get("goal_cmd") or cfg.get("goal_cmd") or "").strip()
+    checkpoint_on_stall = args.get("checkpoint_on_stall", cfg.get("checkpoint_on_stall", True))
+    security_gate = args.get("security_gate", cfg.get("security_gate", False))
+    mode = (args.get("mode") or "fix").strip()
+    assignee = (args.get("assignee") or cfg.get("assignee") or "").strip() or None
+    labels = args.get("labels") or cfg.get("labels") or []
+    if isinstance(labels, str):
+        labels = [l.strip() for l in labels.split(",") if l.strip()]
+    goal_max_turns = int(args.get("goal_max_turns") or cfg.get("goal_max_turns") or 20)
 
     with _LoopLock(name="looprunner-start"):
         state = _load_state()
@@ -444,6 +462,15 @@ def loop_start(args, **kwargs):
             "auto_fix": auto_fix,
             "strict_git_guard": strict_git_guard,
             "verify_timeout": verify_timeout,
+            "goal_cmd": goal_cmd,
+            "checkpoint_on_stall": checkpoint_on_stall,
+            "security_gate": security_gate,
+            "mode": mode,
+            "assignee": assignee,
+            "labels": labels,
+            "goal_max_turns": goal_max_turns,
+            "seen_issues": {},
+            "watch_cards": [],
             "status": "running",
             "round": 0,
             "attempts": 0,
@@ -520,6 +547,23 @@ def loop_start(args, **kwargs):
     })
 
 
+def _finish_loop(loop, state, reason):
+    """Mark the loop terminal and delete its cron jobs.
+
+    The aim is achieved, so the schedule is no longer needed -- a paused job
+    would keep showing up as orphaned state.
+    """
+    loop["status"] = "completed"
+    loop["completed_at"] = _now()
+    loop["updated_at"] = _now()
+    loop["completion_reason"] = reason
+    deleted = _cron_delete(loop.get("cron_job_id")) or _cron_delete(loop.get("retry_cron_id"))
+    loop["cron_job_id"] = None
+    loop["retry_cron_id"] = None
+    _save_state(state)
+    return deleted
+
+
 def _run_verify(loop):
     """Run the loop's verify command. Returns (passed, output, duration_s)."""
     verify_cmd = (loop.get("verify_cmd") or "").strip()
@@ -554,24 +598,16 @@ def loop_tick(args, **kwargs):
         lid = loop["id"]
 
         if _deadline_passed(loop):
-            loop["status"] = "completed"
-            loop["completed_at"] = _now()
-            loop["updated_at"] = _now()
             loop["history"].append({
                 "attempt": loop.get("attempts", 0), "round": loop.get("round", 0),
                 "type": "deadline", "at": _now(), "note": "deadline passed, auto-disabled",
             })
-            _save_state(state)
-            _cron_action(loop.get("cron_job_id"), "pause")
+            _finish_loop(loop, state, "deadline passed")
             return json.dumps({"loop_id": lid, "status": "completed",
                                "reason": "deadline passed", "round": loop.get("round", 0)})
 
         if loop.get("attempts", 0) >= int(loop.get("max_attempts", 20)):
-            loop["status"] = "completed"
-            loop["completed_at"] = _now()
-            loop["updated_at"] = _now()
-            _save_state(state)
-            _cron_action(loop.get("cron_job_id"), "pause")
+            _finish_loop(loop, state, "max_attempts reached")
             return json.dumps({
                 "loop_id": lid, "status": "completed", "reason": "max_attempts reached",
                 "round": loop.get("round", 0), "attempts": loop.get("attempts", 0),
@@ -603,12 +639,38 @@ def loop_tick(args, **kwargs):
         }
 
         if passed:
+            # A goal_cmd, when set, is the real acceptance test: the verify
+            # command passing once is not the same as the aim being achieved.
+            goal_met = True
+            if loop.get("goal_cmd"):
+                g_passed, g_output, _g_dur = _run_verify({
+                    "verify_cmd": loop["goal_cmd"],
+                    "repo_path": loop["repo_path"],
+                    "verify_timeout": loop.get("verify_timeout", 300),
+                })
+                goal_met = bool(g_passed)
+                entry["goal_cmd"] = loop["goal_cmd"]
+                entry["goal_output"] = (g_output or "")[:2000]
+                entry["goal_met"] = goal_met
+
             loop["round"] = int(loop.get("round", 0)) + 1
             loop["last_signature"] = None
             loop["signature_counts"] = {}
             entry["signature"] = None
             loop["history"].append(entry)
             loop["updated_at"] = _now()
+
+            if goal_met and loop["round"] >= int(loop.get("max_rounds", 10)):
+                _finish_loop(loop, state, "goal achieved")
+                return json.dumps({
+                    "loop_id": lid, "status": "completed", "round": loop["round"],
+                    "attempts": loop["attempts"], "result": "PASS",
+                    "reason": "goal achieved",
+                    "duration_s": duration, "branch": current_branch,
+                    "message": ("Goal achieved in %d round(s); the loop's cron job was "
+                                "deleted." % loop["round"]),
+                })
+
             _save_state(state)
             resp = {
                 "loop_id": lid, "status": loop["status"], "round": loop["round"],
@@ -616,6 +678,10 @@ def loop_tick(args, **kwargs):
                 "duration_s": duration, "branch": current_branch,
                 "message": "Round %d passed in %ss." % (loop["round"], duration),
             }
+            if not goal_met:
+                resp["goal_met"] = False
+                resp["message"] += (" The goal command (%s) still fails, so the loop "
+                                    "continues." % loop["goal_cmd"])
             if loop.get("auto_recommend"):
                 resp["recommend_next"] = True
                 resp["message"] += " Consider loop_recommend for the next improvement."
@@ -638,13 +704,38 @@ def loop_tick(args, **kwargs):
             loop["completed_at"] = _now()
             _save_state(state)
             _cron_action(loop.get("cron_job_id"), "pause")
-            return json.dumps({
+
+            # The aim was not met. Snapshot the stage, dispatch a goal-mode card
+            # to decide the best next step, and schedule a retry so the work is
+            # not orphaned.
+            checkpoint = None
+            if loop.get("checkpoint_on_stall", True):
+                checkpoint = _write_checkpoint(loop)
+                if "error" not in checkpoint:
+                    checkpoints = loop.get("checkpoints") or []
+                    checkpoints.append(dict(checkpoint, at=_now()))
+                    loop["checkpoints"] = checkpoints
+            card_id = None
+            try:
+                card_id, _raw = _create_resume_card(
+                    loop, "same failure signature recurred %d times" % repeat)
+            except Exception:
+                card_id = None
+            retry_id = _ensure_retry_cron(loop, state)
+            if checkpoint is not None and "error" not in checkpoint:
+                loop["updated_at"] = _now()
+            _save_state(state)
+
+            resp = {
                 "loop_id": lid, "status": "stalled", "round": loop.get("round", 0),
                 "attempts": loop["attempts"], "result": "FAIL",
                 "signature": sig, "signature_repeats": repeat,
                 "verify_cmd": loop.get("verify_cmd"), "output": output[:2000],
                 "error_line": entry.get("error_line"),
                 "branch": current_branch,
+                "checkpoint": checkpoint if checkpoint and "error" not in checkpoint else None,
+                "resume_card": card_id,
+                "retry_cron_id": retry_id,
                 "message": (
                     "STALLED: the same failure signature has recurred %d times. "
                     "The loop paused its own cron instead of retrying blindly. "
@@ -652,7 +743,16 @@ def loop_tick(args, **kwargs):
                     "loop_revert to roll back the last attempt, or loop_resume "
                     "after changing the approach." % repeat
                 ),
-            })
+            }
+            if checkpoint and "error" not in checkpoint:
+                resp["message"] += (" Stage snapshotted to %s."
+                                    % checkpoint.get("branch"))
+            if card_id:
+                resp["message"] += (" A goal-mode card (%s) was dispatched to decide "
+                                    "the best next step." % card_id)
+            if retry_id:
+                resp["message"] += " A retry cron (%s) will re-run the loop later." % retry_id
+            return json.dumps(resp)
 
         _save_state(state)
         branch = "auto/round-%d" % (loop.get("round", 0) + 1)
@@ -993,6 +1093,25 @@ def loop_commit(args, **kwargs):
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             return _err("not a git repository: %s" % repo_path)
 
+        # Pre-PR security gate: review the pending change set and refuse when a
+        # critical or high finding is present.
+        if bool(args.get("security_gate", loop.get("security_gate", False))):
+            sec = json.loads(loop_security({"loop_id": loop["id"]}, **kwargs))
+            if sec.get("blocking"):
+                return json.dumps({
+                    "loop_id": loop["id"], "committed": False,
+                    "reason": "security gate: blocking findings",
+                    "security": sec,
+                    "message": (
+                        "Refusing to open a PR: the security review found %d blocking "
+                        "issue(s). Fix them and re-run, or pass security_gate=false."
+                        % len(sec.get("blocking_findings", []))
+                    ),
+                })
+            sec_note = "Security review passed (%d finding(s))." % len(sec.get("findings") or [])
+        else:
+            sec_note = ""
+
         commit_msg = (args.get("commit_message") or "looprunner: auto-fix").strip()
         pr_title = (args.get("pr_title") or commit_msg).strip()
         pr_body = (args.get("pr_body") or "Automated fix by LoopRunner.").strip()
@@ -1089,9 +1208,10 @@ def loop_commit(args, **kwargs):
             "pr_url": pr_url, "files_changed": len(changed),
             "diff_stat": stat, "steps": steps,
             "message": (
-                "Committed %d file(s) to %s and opened %s." % (len(changed), branch, pr_url)
-                if pr_url else
-                "Committed %d file(s) to %s; PR creation failed." % (len(changed), branch)
+                ("Committed %d file(s) to %s and opened %s." % (len(changed), branch, pr_url)
+                 if pr_url else
+                 "Committed %d file(s) to %s; PR creation failed." % (len(changed), branch))
+                + ((" " + sec_note) if sec_note else "")
             ),
         })
 
@@ -1224,6 +1344,511 @@ def loop_recommend(args, **kwargs):
     return json.dumps({
         "loop_id": loop["id"], "prompt": prompt,
         "note": "No LLM available -- analyze this prompt to get improvement recommendations.",
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Kanban + goal resilience
+# --------------------------------------------------------------------------- #
+
+def _cron_delete(cron_id):
+    """Delete the loop's cron job. Returns True on success."""
+    if not cron_id or cron_id == "created":
+        return False
+    try:
+        proc = subprocess.run(
+            [_hermes_bin(), "cron", "remove", cron_id],
+            capture_output=True, text=True, timeout=15,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _kanban(args, timeout=90):
+    """Run ``hermes kanban <args>``; return (rc, output)."""
+    return _run([_hermes_bin(), "kanban"] + [str(a) for a in args], timeout=timeout)
+
+
+def _kanban_create(title, body, assignee=None, parent=None, goal=False,
+                   goal_max_turns=None, priority=None, skills=None, workspace=None):
+    """Create a kanban card; return (card_id, raw_output)."""
+    argv = ["create", title, "--body", body, "--json"]
+    if assignee:
+        argv += ["--assignee", str(assignee)]
+    if parent:
+        argv += ["--parent", str(parent)]
+    if goal:
+        argv += ["--goal"]
+    if goal_max_turns:
+        argv += ["--goal-max-turns", str(goal_max_turns)]
+    if priority is not None:
+        argv += ["--priority", str(priority)]
+    for s in (skills or []):
+        argv += ["--skill", str(s)]
+    if workspace:
+        argv += ["--workspace", str(workspace)]
+    rc, out = _kanban(argv)
+    card_id = None
+    if rc == 0:
+        try:
+            card_id = json.loads(out).get("id")
+        except Exception:
+            m = re.search(r'"id"\s*:\s*"([^"]+)"', out)
+            card_id = m.group(1) if m else None
+    return card_id, out
+
+
+def _checkpoint_name():
+    return "looprunner/checkpoint-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def _write_checkpoint(loop):
+    """Snapshot the loop's current stage: a git ref plus a patch of any dirty work.
+
+    Returns a dict describing what was captured, or an error string.
+    """
+    repo_path = loop["repo_path"]
+    git = _git_path()
+    branch = _checkpoint_name()
+
+    rc, _ = _run([git, "branch", branch], cwd=repo_path, timeout=20)
+    if rc != 0:
+        return {"error": "could not create checkpoint branch %s" % branch}
+
+    captured = {"branch": branch, "patch_file": None, "dirty": False}
+    rc, patch = _run([git, "diff", "HEAD"], cwd=repo_path, timeout=30)
+    _rc, untracked = _run([git, "ls-files", "--others", "--exclude-standard"],
+                          cwd=repo_path, timeout=20)
+    if patch.strip() or untracked.strip():
+        _dir, _ = _paths()
+        patch_path = _dir / ("%s.patch" % branch.replace("/", "-"))
+        blob = patch
+        for rel in untracked.splitlines():
+            rel = rel.strip()
+            if not rel or _is_artifact(rel):
+                continue
+            try:
+                body = Path(repo_path, rel).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                blob += "\n--- untracked (unreadable): %s ---\n" % rel
+                continue
+            blob += "\n--- untracked file: %s ---\n%s\n" % (rel, body[:8000])
+        try:
+            patch_path.write_text(blob, encoding="utf-8")
+            captured["patch_file"] = str(patch_path)
+        except Exception as e:
+            captured["patch_file"] = None
+            captured["patch_error"] = str(e)
+        captured["dirty"] = True
+    return captured
+
+
+def loop_checkpoint(args, **kwargs):
+    """Snapshot the loop's current stage to a git branch (plus a dirty-work patch)."""
+    loop_id = (args.get("loop_id") or "").strip()
+    with _LoopLock(name=("loop-%s" % loop_id) if loop_id else "looprunner"):
+        state = _load_state()
+        loop = _resolve_loop(state.get("loops", {}), loop_id)
+        if not loop:
+            return _err("no loop found")
+        captured = _write_checkpoint(loop)
+        if "error" in captured:
+            return _err(captured["error"])
+        checkpoints = loop.get("checkpoints") or []
+        checkpoints.append(dict(captured, at=_now()))
+        loop["checkpoints"] = checkpoints
+        loop["updated_at"] = _now()
+        _save_state(state)
+    return json.dumps({
+        "loop_id": loop["id"], "checkpoint": captured,
+        "message": ("Checkpoint %s created (%s)."
+                    % (captured["branch"],
+                       "dirty work captured in a patch" if captured["dirty"] else "clean tree")),
+    })
+
+
+def _create_resume_card(loop, reason):
+    """Dispatch a goal-mode kanban card to decide the best next step."""
+    goal = loop.get("goal") or "(no goal recorded)"
+    body = (
+        "A LoopRunner loop stopped before its goal was met.\n\n"
+        "Loop: %s\nRepository: %s\nGoal: %s\nReason: %s\n"
+        "Round (passes): %s\nAttempts (verify runs): %s\n"
+        "Last failure signature: %s\n\n"
+        "Your job (do NOT just retry blindly):\n"
+        "1. Read the loop state and the failure output.\n"
+        "2. Decide the single best next action: change the approach, roll back "
+        "the last attempt with loop_revert, or conclude the goal is unachievable "
+        "as written.\n"
+        "3. Either apply that action, or leave a comment explaining the decision "
+        "and block this card.\n\n"
+        "Acceptance: a concrete decision has been made and either executed or "
+        "recorded with a reason."
+        % (
+            loop["id"], loop["repo_path"], goal, reason,
+            loop.get("round", 0), loop.get("attempts", 0),
+            loop.get("last_signature"),
+        )
+    )
+    card_id, raw = _kanban_create(
+        "Resume loop %s: %s" % (loop["id"], goal[:70]),
+        body,
+        assignee=loop.get("assignee"),
+        goal=True,
+        goal_max_turns=loop.get("goal_max_turns", 20),
+        skills=["looprunner-pattern"],
+    )
+    return card_id, raw
+
+
+def _ensure_retry_cron(loop, state):
+    """Give a stalled loop a fresh cron so it is retried later.
+
+    The loop's own cron is paused on stall; without a retry the work would be
+    orphaned. The retry fires at a longer interval than the original.
+    """
+    existing = loop.get("retry_cron_id")
+    if existing:
+        return existing
+    interval = max(int(loop.get("interval_minutes", 60)), 30) * 4
+    loop_id = loop["id"]
+    try:
+        proc = subprocess.run(
+            [_hermes_bin(), "cron", "create",
+             "every %dm" % interval,
+             "Retry stalled LoopRunner loop %s (goal: %s)"
+             % (loop_id, (loop.get("goal") or "not set")[:80])],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            m = re.search(r"Created job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
+            retry_id = m.group(1) if m else None
+            if retry_id:
+                loop["retry_cron_id"] = retry_id
+                loop["updated_at"] = _now()
+                _save_state(state)
+                return retry_id
+    except Exception:
+        pass
+    return None
+
+
+def loop_watch(args, **kwargs):
+    """Start watching a repository's issues and dispatching reproduction cards.
+
+    Each new open issue becomes a goal-mode kanban card that reproduces and
+    diagnoses it; that card is responsible for spawning the follow-up fix card.
+    """
+    repo_path = (args.get("repo_path") or "").strip()
+    if not repo_path:
+        return _err("repo_path is required")
+    if not Path(repo_path).exists():
+        return _err("repo_path does not exist: %s" % repo_path)
+
+    cfg = kwargs.get("config") or {}
+    interval = int(args.get("interval_minutes") or cfg.get("interval_minutes") or 60)
+    assignee = (args.get("assignee") or cfg.get("assignee") or "").strip() or None
+    goal = (args.get("goal") or "triage incoming issues").strip()
+    labels = args.get("labels") or []
+    if isinstance(labels, str):
+        labels = [l.strip() for l in labels.split(",") if l.strip()]
+    goal_max_turns = int(args.get("goal_max_turns") or 20)
+
+    with _LoopLock(name="looprunner-start"):
+        state = _load_state()
+        loop_id = uuid.uuid4().hex[:12]
+        state["loops"][loop_id] = {
+            "id": loop_id,
+            "repo_path": repo_path,
+            "verify_cmd": "",
+            "max_rounds": 0,
+            "max_attempts": 0,
+            "stall_threshold": 3,
+            "goal": goal,
+            "deadline": "",
+            "interval_minutes": interval,
+            "branch_guard": False,
+            "auto_recommend": False,
+            "auto_fix": False,
+            "strict_git_guard": False,
+            "verify_timeout": 300,
+            "goal_cmd": "",
+            "checkpoint_on_stall": False,
+            "security_gate": False,
+            "mode": "watch",
+            "assignee": assignee,
+            "labels": labels,
+            "goal_max_turns": goal_max_turns,
+            "seen_issues": {},
+            "watch_cards": [],
+            "status": "running",
+            "round": 0,
+            "attempts": 0,
+            "created_at": _now(),
+            "updated_at": _now(),
+            "completed_at": None,
+            "cron_job_id": None,
+            "prs": [],
+            "history": [],
+            "last_signature": None,
+            "signature_counts": {},
+            "checkpoints": [],
+            "retry_cron_id": None,
+        }
+        _save_state(state)
+
+    cron_job_id = None
+    cron_error = None
+    try:
+        proc = subprocess.run(
+            [_hermes_bin(), "cron", "create", "every %dm" % interval,
+             "Run loop_scan_issues on loop %s" % loop_id],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            m = re.search(r"Created job[:\s]+([a-f0-9]+)", proc.stdout + proc.stderr, re.I)
+            cron_job_id = m.group(1) if m else "created"
+        else:
+            cron_error = (proc.stdout + proc.stderr).strip()[:500]
+    except Exception as e:
+        cron_error = "exception: %s" % e
+
+    if cron_job_id or cron_error:
+        with _LoopLock(name="loop-%s" % loop_id):
+            state = _load_state()
+            loop = state["loops"].get(loop_id)
+            if loop:
+                loop["cron_job_id"] = cron_job_id
+                if cron_error:
+                    loop["_cron_error"] = cron_error
+                _save_state(state)
+
+    return json.dumps({
+        "loop_id": loop_id, "mode": "watch", "repo_path": repo_path,
+        "interval_minutes": interval, "assignee": assignee, "labels": labels,
+        "cron_job_id": cron_job_id,
+        "message": ("Watching %s every %dm." % (repo_path, interval))
+                   + (" Cron error: %s" % cron_error if cron_error else ""),
+    })
+
+
+def loop_scan_issues(args, **kwargs):
+    """One watch pass: dispatch a reproduction card for every new open issue."""
+    loop_id = (args.get("loop_id") or "").strip()
+    with _LoopLock(name=("loop-%s" % loop_id) if loop_id else "looprunner"):
+        state = _load_state()
+        loops = state.get("loops", {})
+        loop = _resolve_loop(loops, loop_id, active_only=True)
+        if not loop:
+            return _err("no active loop found")
+        if loop.get("mode") != "watch":
+            return _err("loop %s is not a watch loop" % loop["id"])
+        lid = loop["id"]
+        repo_path = loop["repo_path"]
+
+        gh_args = ["issue", "list", "--state", "open", "--limit", "100",
+                   "--json", "number,title,body,labels,url"]
+        labels = loop.get("labels") or []
+        if labels:
+            gh_args += ["--label", ",".join(labels)]
+        rc, out = _run([_gh_path()] + gh_args, cwd=repo_path, timeout=90)
+        if rc != 0:
+            return _err("gh issue list failed: %s" % out.strip()[:300])
+        try:
+            issues = json.loads(out)
+        except Exception:
+            return _err("could not parse the issue list")
+
+        seen = loop.get("seen_issues") or {}
+        new_cards = []
+        for iss in issues:
+            num = str(iss.get("number"))
+            if num in seen:
+                continue
+            title = (iss.get("title") or "").strip()
+            body = (iss.get("body") or "").strip()
+            url = iss.get("url", "")
+            card_body = (
+                "You are reproducing a reported issue in the repository %s.\n\n"
+                "## Issue #%s: %s\n\n%s\n\n## URL\n%s\n\n"
+                "## Your job\n"
+                "1. Read the issue and identify the reported behaviour.\n"
+                "2. Reproduce it: write a failing check or a small script that "
+                "demonstrates the bug, and run it. Record the exact command.\n"
+                "3. Find the root cause and the minimal fix.\n"
+                "4. Report findings as a comment on this card:\n"
+                "   REPRODUCED / STEPS / OBSERVED / EXPECTED / ROOT CAUSE "
+                "(file:line) / SUGGESTED FIX.\n"
+                "5. Create the follow-up fix card: call kanban_create (or run "
+                "`hermes kanban create`) with title \"Fix issue #%s: %s\", the "
+                "findings as the body, --parent set to THIS card, and --goal. "
+                "Tell the fix card to apply the change and open a PR with "
+                "loop_commit.\n"
+                "6. Complete this card.\n\n"
+                "Do NOT fix the issue yourself — reproduce and diagnose only."
+                % (repo_path, num, title, body, url, num, title)
+            )
+            card_id, raw = _kanban_create(
+                "Reproduce issue #%s: %s" % (num, title[:80]),
+                card_body,
+                assignee=loop.get("assignee"),
+                goal=True,
+                goal_max_turns=loop.get("goal_max_turns", 20),
+                skills=["looprunner-pattern"],
+            )
+            seen[num] = {"card_id": card_id, "title": title, "url": url, "at": _now()}
+            new_cards.append({"issue": num, "card_id": card_id, "title": title})
+
+        loop["seen_issues"] = seen
+        loop["updated_at"] = _now()
+        _save_state(state)
+
+    return json.dumps({
+        "loop_id": lid, "issues_seen": len(seen), "new_cards": new_cards,
+        "message": ("%d new issue(s) dispatched." % len(new_cards))
+                   if new_cards else "No new issues.",
+    })
+
+
+_SECURITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string",
+                                 "enum": ["critical", "high", "medium", "low", "info"]},
+                    "path": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["severity", "title", "detail"],
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["findings", "summary"],
+}
+
+_BLOCKING_SEVERITIES = ("critical", "high")
+
+
+def _collect_diff(repo_path):
+    """Return (patch_text, untracked_files, changed_files).
+
+    Untracked files never appear in ``git diff``, so their contents are read
+    and appended -- otherwise a secret committed as a *new* file would pass the
+    pre-PR review unexamined.
+    """
+    git = _git_path()
+    _rc, staged = _run([git, "diff", "--cached"], cwd=repo_path, timeout=30)
+    _rc, unstaged = _run([git, "diff"], cwd=repo_path, timeout=30)
+    _rc, untracked = _run([git, "ls-files", "--others", "--exclude-standard"],
+                          cwd=repo_path, timeout=20)
+    _rc, changed = _run([git, "status", "--porcelain"], cwd=repo_path, timeout=20)
+    files = [l for l in changed.splitlines() if l.strip() and not _is_artifact(l)]
+
+    new_content = ""
+    for rel in untracked.splitlines():
+        rel = rel.strip()
+        if not rel or _is_artifact(rel):
+            continue
+        try:
+            body = Path(repo_path, rel).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        new_content += "\n--- new file: %s ---\n%s\n" % (rel, body[:4000])
+    return (staged + "\n" + unstaged + new_content), untracked.strip(), files
+
+
+def loop_security(args, **kwargs):
+    """Security review of the loop's pending change set.
+
+    This is the pre-PR gate: it reviews the diff (staged + unstaged + untracked)
+    and returns typed findings. ``loop_commit(security_gate=True)`` calls it and
+    refuses to open a PR when a critical or high finding is present.
+    """
+    loop_id = (args.get("loop_id") or "").strip()
+    state = _load_state()
+    loop = _resolve_loop(state.get("loops", {}), loop_id)
+    if not loop:
+        return _err("no loop found")
+    repo_path = loop["repo_path"]
+    patch, untracked, files = _collect_diff(repo_path)
+    if not patch.strip() and not untracked:
+        return json.dumps({
+            "loop_id": loop["id"], "findings": [], "summary": "No pending changes.",
+            "blocking": False,
+        })
+
+    if _ctx is None:
+        return json.dumps({
+            "loop_id": loop["id"], "findings": None,
+            "note": "No plugin context available; cannot run the security review.",
+            "blocking": False,
+        })
+
+    prompt = (
+        "Review this change set for security flaws. Repository: %s\n\n"
+        "Changed files:\n%s\n\n"
+        "Untracked files:\n%s\n\n"
+        "Diff:\n%s\n\n"
+        "Report only real, demonstrable issues introduced by this change: "
+        "credentials or secrets in code, injection sinks (SQL/shell/command), "
+        "path traversal, unsafe deserialization, CSRF/auth bypasses, weak "
+        "crypto, SSRF, and similar. For each: severity, path, line, title, "
+        "detail, and the exact offending excerpt. Do not report style issues."
+        % (repo_path, "\n".join(files[:40]), untracked or "(none)", patch[:20000])
+    )
+
+    try:
+        result = _ctx.llm.complete_structured(
+            instructions=(
+                "You are a security reviewer. Review the supplied diff for real, "
+                "demonstrable security flaws introduced by this change. Be precise; "
+                "do not invent findings."
+            ),
+            input=[{"type": "text", "text": prompt}],
+            json_schema=_SECURITY_SCHEMA,
+            schema_name="looprunner.security",
+            purpose="looprunner.security",
+            temperature=0.0,
+            max_tokens=1200,
+        )
+    except Exception as e:
+        return json.dumps({
+            "loop_id": loop["id"], "findings": None,
+            "note": "Security review failed (%s: %s)." % (type(e).__name__, e),
+            "blocking": False,
+        })
+
+    parsed = getattr(result, "parsed", None)
+    if not isinstance(parsed, dict):
+        return json.dumps({
+            "loop_id": loop["id"], "findings": None,
+            "raw": (getattr(result, "text", "") or "")[:4000],
+            "note": "Security review returned no parseable findings; raw output attached.",
+            "blocking": False,
+        })
+
+    findings = parsed.get("findings") or []
+    blocking = [f for f in findings
+                if str(f.get("severity", "")).lower() in _BLOCKING_SEVERITIES]
+    return json.dumps({
+        "loop_id": loop["id"],
+        "findings": findings,
+        "summary": parsed.get("summary", ""),
+        "blocking": bool(blocking),
+        "blocking_findings": blocking,
+        "message": (
+            "%d finding(s), %d blocking."
+            % (len(findings), len(blocking))
+        ),
     })
 
 

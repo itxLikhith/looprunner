@@ -65,6 +65,30 @@ failures, fix, open PR, repeat — with hard budgets so it cannot run forever.
   improvements with effort estimates.
 * `loop_analyze` is the tool to reach for after a FAIL; it returns typed JSON.
 
+## Goal resilience
+
+* `goal_cmd` is the real acceptance test: the loop completes only when it exits 0, not
+  merely when `verify_cmd` passes once.
+* On completion the loop's cron job is **deleted**.
+* On stall (`checkpoint_on_stall`, default true) the loop:
+  1. snapshots the stage to `looprunner/checkpoint-<ts>` (git ref + dirty-work patch);
+  2. dispatches a goal-mode kanban card to decide the best next step;
+  3. schedules a retry cron at 4x the interval.
+* `loop_checkpoint` does the snapshot on demand.
+
+## Issue-driven maintenance
+
+* `loop_watch(repo_path=..., interval_minutes=..., labels=[...])` scans open issues on a
+  cron and dispatches a goal-mode reproduction card per new issue; the card spawns the
+  follow-up fix card. Issue numbers are remembered, so rescans do not duplicate.
+* `loop_scan_issues` runs one pass manually.
+
+## Security gate
+
+* `loop_security(loop_id=...)` reviews the pending diff (staged + unstaged + untracked) and
+  returns typed findings with a `blocking` flag for critical/high.
+* `loop_commit(..., security_gate=True)` refuses to open a PR when blocking findings exist.
+
 ## Auto-setup
 
 * `loop_start` auto-creates a cron job that ticks every `interval_minutes`.

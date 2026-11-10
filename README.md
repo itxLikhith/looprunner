@@ -26,11 +26,15 @@ when retrying is pointless:
 | `loop_tick` | Run one verify round; records pass/fail, duration, signature |
 | `loop_verify` | Dry-run the verify command without recording a round |
 | `loop_analyze` | Structured LLM diagnosis: root cause, failing tests, files, fix, confidence |
-| `loop_commit` | Branch + commit + push + PR (refuses clean trees; `dry_run` supported) |
+| `loop_commit` | Branch + commit + push + PR (refuses clean trees; `dry_run`, `security_gate`) |
 | `loop_revert` | Close the last PR, delete its branch, return to the previous branch |
 | `loop_status` | Round/attempt counts, budgets, signature, PRs, elapsed time |
 | `loop_history` | Full round history |
 | `loop_recommend` | LLM suggestions for the repository |
+| `loop_watch` | Watch open issues and dispatch reproduction cards |
+| `loop_scan_issues` | One watch pass (called by the watch cron) |
+| `loop_security` | Security review of the pending diff |
+| `loop_checkpoint` | Snapshot the current stage to a branch + patch |
 | `loop_pause` / `loop_resume` / `loop_stop` | Control the loop and its cron |
 
 ## Install
@@ -40,16 +44,54 @@ hermes plugins install /path/to/looprunner
 hermes plugins enable looprunner
 ```
 
+## Issue-driven maintenance
+
+`loop_watch(repo_path=..., interval_minutes=60)` scans the repository's open issues on a
+cron and dispatches a **goal-mode kanban card** for each new one. That card reproduces
+and diagnoses the issue, then spawns a follow-up fix card (as its child) that applies the
+change and opens a PR with `loop_commit`. Issue numbers are remembered, so a rescan never
+dispatches the same issue twice.
+
+## Goal resilience
+
+A loop with a `goal` stops early for three reasons: the deadline passes, the attempt budget
+is exhausted, or it **stalls** (the same failure signature recurring `stall_threshold` times).
+
+* When the aim is achieved, the loop's cron job is **deleted** — no orphaned schedule.
+* When it stalls, the loop:
+  1. snapshots the stage to `looprunner/checkpoint-<timestamp>` (a git ref plus a patch of
+     any dirty work) — `loop_checkpoint` does the same on demand;
+  2. dispatches a goal-mode kanban card that decides the best next step (change approach,
+     `loop_revert`, or conclude the goal is unachievable) rather than retrying blindly;
+  3. schedules a **retry cron** at a longer interval so the work is picked up again.
+
+Set `checkpoint_on_stall: false` to opt out. An optional `goal_cmd` is the real acceptance
+test: the loop only completes when it exits 0, not merely when the verify command passes.
+
+## Security gate
+
+`loop_security(loop_id=...)` reviews the pending change set (staged, unstaged and untracked)
+with the host LLM and returns typed findings. `loop_commit(security_gate=True)` — or
+`security_gate: true` on the loop — refuses to open a PR when a **critical** or **high**
+finding is present. Untracked files are read directly, so a secret committed as a *new* file
+is still reviewed.
+
 ## Usage
 
 ```
 loop_start(repo_path="/path/to/repo", verify_cmd="cargo test",
-           max_rounds=5, max_attempts=10, stall_threshold=3)
+           max_rounds=5, max_attempts=10, stall_threshold=3,
+           goal="ship v1.0", goal_cmd="make release-check",
+           security_gate=true)
 loop_tick()
 loop_analyze()      # after a FAIL
 loop_verify()       # confirm the fix without recording a round
 loop_commit()       # branch + PR
 loop_tick()         # confirm the pass
+```
+
+```
+loop_watch(repo_path="/path/to/repo", interval_minutes=60, labels=["bug"])
 ```
 
 ## Safety

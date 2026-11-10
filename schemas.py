@@ -32,6 +32,14 @@ LOOP_START = {
                 ),
             },
             "goal": {"type": "string", "description": "What this loop should accomplish (e.g. 'ship v1.0')"},
+            "goal_cmd": {
+                "type": "string",
+                "description": (
+                    "Optional acceptance command for the goal. When set, the loop only "
+                    "completes when this exits 0 -- the verify command passing once is "
+                    "not the same as the aim being achieved."
+                ),
+            },
             "deadline": {"type": "string", "description": "ISO date by which goal must be met (auto-disables after)"},
             "interval_minutes": {"type": "integer", "description": "Cron interval in minutes (default 60)"},
             "branch_guard": {"type": "boolean", "description": "Auto-create a working branch when on main/master (default true)"},
@@ -44,9 +52,93 @@ LOOP_START = {
                     "(default true). loop_commit stays allowed."
                 ),
             },
+            "checkpoint_on_stall": {
+                "type": "boolean",
+                "description": (
+                    "On stall, snapshot the stage to a git branch + patch, dispatch a "
+                    "goal-mode kanban card to decide the next step, and schedule a retry "
+                    "cron (default true)."
+                ),
+            },
+            "security_gate": {
+                "type": "boolean",
+                "description": (
+                    "Run a security review of the pending diff before opening a PR and "
+                    "refuse on critical/high findings (default false)."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "description": "fix (default) runs verify_cmd; watch is for issue monitoring",
+            },
+            "assignee": {"type": "string", "description": "Kanban profile to assign dispatched cards to"},
+            "labels": {"type": "array", "items": {"type": "string"}, "description": "Only watch issues carrying these labels"},
+            "goal_max_turns": {"type": "integer", "description": "Turn budget for goal-mode cards (default 20)"},
             "verify_timeout": {"type": "integer", "description": "Seconds before the verify command is killed (default 300)"},
         },
         "required": ["repo_path"],
+    },
+}
+
+LOOP_WATCH = {
+    "name": "loop_watch",
+    "description": (
+        "Watch a repository's open issues and dispatch a goal-mode kanban card for each "
+        "new one. The card reproduces and diagnoses the issue, then spawns a follow-up "
+        "fix card that applies the change and opens a PR."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "repo_path": {"type": "string", "description": "Absolute path to the repository"},
+            "interval_minutes": {"type": "integer", "description": "How often to scan for new issues"},
+            "assignee": {"type": "string", "description": "Kanban profile to assign cards to"},
+            "goal": {"type": "string", "description": "Goal recorded on the watch loop"},
+            "labels": {"type": "array", "items": {"type": "string"}, "description": "Only dispatch issues with these labels"},
+            "goal_max_turns": {"type": "integer", "description": "Turn budget for goal-mode cards"},
+        },
+        "required": ["repo_path"],
+    },
+}
+
+LOOP_SCAN_ISSUES = {
+    "name": "loop_scan_issues",
+    "description": (
+        "Run one watch pass: dispatch a reproduction card for every new open issue. "
+        "Called by the watch loop's cron job."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"loop_id": {"type": "string", "description": "Watch loop id"}},
+        "required": [],
+    },
+}
+
+LOOP_SECURITY = {
+    "name": "loop_security",
+    "description": (
+        "Security review of the loop's pending change set (staged + unstaged + untracked). "
+        "Returns typed findings and a 'blocking' flag for critical/high severity. "
+        "Use before loop_commit, or let loop_commit's security_gate do it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"loop_id": {"type": "string", "description": "Loop id (empty = most recent)"}},
+        "required": [],
+    },
+}
+
+LOOP_CHECKPOINT = {
+    "name": "loop_checkpoint",
+    "description": (
+        "Snapshot the loop's current stage: create a git branch at the current HEAD and "
+        "write any dirty work to a patch file. Use before a risky step or when the "
+        "loop stops early."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"loop_id": {"type": "string", "description": "Loop id (empty = most recent)"}},
+        "required": [],
     },
 }
 
@@ -183,6 +275,10 @@ LOOP_COMMIT = {
             "pr_title": {"type": "string", "description": "PR title"},
             "pr_body": {"type": "string", "description": "PR body/description"},
             "dry_run": {"type": "boolean", "description": "Report the diff stat without writing anything"},
+            "security_gate": {
+                "type": "boolean",
+                "description": "Override the loop's security_gate setting for this commit",
+            },
         },
         "required": [],
     },
