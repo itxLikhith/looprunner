@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 
 from . import schemas, tools
 
@@ -118,47 +119,36 @@ def register(ctx):
         logger.warning("Could not register auxiliary task: %s", e)
 
     # Register in-session slash command.
-    # Accepts a verb ("start", "stop", "tick", "why", ...) or a bare repository
-    # reference, so "/looprunner colorama" does something useful instead of
-    # demanding a loop_id.
-    _VERBS = {
-        "status": "loop_status", "state": "loop_status", "progress": "loop_status",
-        "how": "loop_status", "hows": "loop_status",
-        "start": "loop_start", "run": "loop_start", "begin": "loop_start",
-        "detect": "loop_detect", "inspect": "loop_detect",
-        "watch": "loop_watch", "monitor": "loop_watch",
-        "stop": "loop_stop", "halt": "loop_stop",
-        "pause": "loop_pause",
-        "resume": "loop_resume", "continue": "loop_resume",
-        "tick": "loop_tick", "advance": "loop_tick", "step": "loop_tick",
-        "analyze": "loop_analyze", "diagnose": "loop_analyze", "why": "loop_analyze",
-        "fix": "loop_analyze",
-        "revert": "loop_revert", "undo": "loop_revert", "rollback": "loop_revert",
-        "security": "loop_security", "audit": "loop_security",
-        "history": "loop_history", "log": "loop_history",
-        "checkpoint": "loop_checkpoint", "snapshot": "loop_checkpoint",
-    }
-
-    def _slash_handler(raw_args: str):
+    #
+    # The handler does NO parsing. Whatever the user typed is handed to the model
+    # verbatim, with the tool list, and the model decides what to do -- including
+    # running several tools in order. Hardcoding verbs or path heuristics here
+    # just recreates the problem we are trying to avoid.
+    def _slash_handler(raw_args: str, session_key: str = "", **ctx):
         raw = (raw_args or "").strip()
         if not raw:
             return tools.loop_status({}, **{})
-        parts = raw.split(None, 1)
-        verb = parts[0].lower()
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        if verb in _VERBS:
-            fn = getattr(tools, _VERBS[verb])
-            args = {"repo_path": rest} if verb in ("start", "run", "begin", "detect",
-                                                   "inspect", "watch", "monitor") else {}
-            return fn(args, **{})
-        # Not a recognised verb. Do NOT guess that it is a repository name --
-        # hand the raw text to the model, which knows the full tool surface and
-        # can decide what the user meant.
-        return _handoff_prompt(raw)
+
+        # Hand the user's words to the model as a real turn. The handler does no
+        # parsing at all: the model knows the full tool surface and decides what
+        # to do, including calling several tools in order.
+        prompt = _handoff_prompt(raw)
+        injected = False
+        try:
+            injected = bool(tools._ctx.inject_message(
+                prompt, role="user", session_key=session_key or None))
+        except Exception as e:
+            logger.debug("inject_message failed: %s", e)
+        if injected:
+            # The model will act on the queued turn; nothing to print here.
+            return "LoopRunner: handing that to the agent."
+        # Injection unavailable (e.g. no live session): return the prompt so the
+        # caller still sees what to do.
+        return prompt
 
 
     def _handoff_prompt(raw):
-        """Return a prompt the model can act on for unrecognised input."""
+        """Return a prompt the model can act on."""
         try:
             names = ", ".join(sorted(_SCHEMAS))
         except Exception:
@@ -168,11 +158,14 @@ def register(ctx):
             "user_input": raw,
             "available_tools": names,
             "instruction": (
-                "The user typed '/looprunner %s'. That is not a recognised verb and "
-                "not necessarily a repository name. Decide what they want from the "
-                "LoopRunner tool surface and act on it: start a loop, report status, "
-                "diagnose a failure, roll back a PR, review the diff for security, "
-                "watch the repository's issues, and so on. If you cannot tell, ask "
+                "The user typed '/looprunner %s'. Interpret it against the "
+                "LoopRunner tool surface and act on it. You may call several "
+                "tools in order (for example: loop_detect to identify the "
+                "repository and its verify command, then loop_start, then "
+                "loop_tick; or loop_status, then loop_analyze, then loop_commit). "
+                "Infer the repository from the words rather than asking for an "
+                "absolute path, and omit verify_cmd when the project type is "
+                "recognisable. If you genuinely cannot tell what they want, ask "
                 "one short question." % raw
             ),
         })

@@ -51,19 +51,20 @@ The plugin is built to be driven by intent, not by memorised arguments:
 * Errors carry the fix, and `loop_status` returns a `next_action` telling the agent
   what to do next.
 
-The `/looprunner` slash command takes a verb, or hands the text to the model:
+The `/looprunner` slash command does no parsing at all. Whatever the user typed is
+injected into the session as a user turn (`ctx.inject_message`), so the model interprets
+it against the full tool surface and acts — including calling several tools in order.
+`/looprunner` with no arguments reports status.
 
 ```
-/looprunner                       status
-/looprunner start colorama-test   start a loop (auto-detects the verify command)
-/looprunner why                   diagnose the last failure
-/looprunner undo                  roll back the last PR
-/looprunner security              review the pending diff
-/looprunner pause|resume|stop     control the loop
+/looprunner                                          status
+/looprunner start a loop on colorama-test            -> the model does it
+/looprunner keep my tests green on X and fix failures -> the model does it
+/looprunner why did it stop / undo the last change    -> the model does it
 ```
 
-Anything else is handed to the model as a handoff prompt rather than guessed at — the
-model knows the full tool surface and decides what the user meant.
+Requires `plugins.entries.looprunner.allow_gateway_injection: true` in `config.yaml`;
+without it the handler falls back to returning the handoff prompt as text.
 
 ## Install
 
