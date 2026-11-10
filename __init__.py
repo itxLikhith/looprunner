@@ -1,8 +1,6 @@
 """LoopRunner plugin — registration."""
 
-import json
 import logging
-import os
 
 from . import schemas, tools
 
@@ -118,62 +116,15 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register auxiliary task: %s", e)
 
-    # Register in-session slash command.
+    # No slash command. A plugin slash command is a deterministic surface (the
+    # bundled disk-cleanup and advanced-delegation plugins both parse a fixed
+    # subcommand table), and routing free text through the model would need
+    # ctx.inject_message -- a host API meant for external feeds (webhooks,
+    # bridges), disabled by default and absent from the capability registry.
     #
-    # The handler does NO parsing. Whatever the user typed is handed to the model
-    # verbatim, with the tool list, and the model decides what to do -- including
-    # running several tools in order. Hardcoding verbs or path heuristics here
-    # just recreates the problem we are trying to avoid.
-    def _slash_handler(raw_args: str, session_key: str = "", **ctx):
-        raw = (raw_args or "").strip()
-        if not raw:
-            return tools.loop_status({}, **{})
-
-        # Hand the user's words to the model as a real turn. The handler does no
-        # parsing at all: the model knows the full tool surface and decides what
-        # to do, including calling several tools in order.
-        prompt = _handoff_prompt(raw)
-        injected = False
-        try:
-            injected = bool(tools._ctx.inject_message(
-                prompt, role="user", session_key=session_key or None))
-        except Exception as e:
-            logger.debug("inject_message failed: %s", e)
-        if injected:
-            # The model will act on the queued turn; nothing to print here.
-            return "LoopRunner: handing that to the agent."
-        # Injection unavailable (e.g. no live session): return the prompt so the
-        # caller still sees what to do.
-        return prompt
-
-
-    def _handoff_prompt(raw):
-        """Return a prompt the model can act on."""
-        try:
-            names = ", ".join(sorted(_SCHEMAS))
-        except Exception:
-            names = "loop_start, loop_tick, loop_status, ..."
-        return json.dumps({
-            "handoff": True,
-            "user_input": raw,
-            "available_tools": names,
-            "instruction": (
-                "The user typed '/looprunner %s'. Interpret it against the "
-                "LoopRunner tool surface and act on it. You may call several "
-                "tools in order (for example: loop_detect to identify the "
-                "repository and its verify command, then loop_start, then "
-                "loop_tick; or loop_status, then loop_analyze, then loop_commit). "
-                "Infer the repository from the words rather than asking for an "
-                "absolute path, and omit verify_cmd when the project type is "
-                "recognisable. If you genuinely cannot tell what they want, ask "
-                "one short question." % raw
-            ),
-        })
-
-    try:
-        ctx.register_command("looprunner", _slash_handler)
-    except Exception as e:
-        logger.warning("Could not register slash command: %s", e)
+    # Intent belongs in chat: the bundled skill plus the tool descriptions let
+    # the model interpret "keep my tests green on X" directly, infer the repo,
+    # detect the verify command and run the loop.
 
     # Store ctx reference for tools that need LLM access
     tools.set_ctx(ctx)

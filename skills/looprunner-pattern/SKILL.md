@@ -41,11 +41,8 @@ Rules:
 * **Report what you inferred.** "Started a loop on `colorama`, using `.venv/bin/python
   -m pytest -q`." — so the user can correct you.
 * If a tool returns an error, read its message: LoopRunner errors carry the fix.
-* The `/looprunner` slash command does no parsing: the user's text is injected into the
-  session as a user turn (`ctx.inject_message`) and the model interprets it against the
-  full tool surface, calling several tools in order when needed. Needs
-  `plugins.entries.looprunner.allow_gateway_injection: true`; otherwise it returns the
-  handoff prompt as text.
+* There is no `/looprunner` slash command — intent is handled in plain chat, where the
+  model can call several tools in order.
 
 ## Steps
 

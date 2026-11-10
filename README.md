@@ -41,7 +41,19 @@ when retrying is pointless:
 
 ## Talk to it, don't learn it
 
-The plugin is built to be driven by intent, not by memorised arguments:
+The plugin is built to be driven by intent, not by memorised arguments — in plain chat,
+not through a slash command:
+
+```
+you: keep my tests green on colorama-test
+     -> the model detects the repo and its verify command, starts a loop, ticks it
+
+you: why did it stop?
+     -> loop_status, then loop_analyze
+
+you: undo that last change
+     -> loop_revert
+```
 
 * `repo_path` accepts an **absolute path, a relative path, `~`, or a bare project
   name** (`loop_start(repo_path="colorama-test")`). A wrong name comes back with
@@ -51,20 +63,13 @@ The plugin is built to be driven by intent, not by memorised arguments:
 * Errors carry the fix, and `loop_status` returns a `next_action` telling the agent
   what to do next.
 
-The `/looprunner` slash command does no parsing at all. Whatever the user typed is
-injected into the session as a user turn (`ctx.inject_message`), so the model interprets
-it against the full tool surface and acts — including calling several tools in order.
-`/looprunner` with no arguments reports status.
-
-```
-/looprunner                                          status
-/looprunner start a loop on colorama-test            -> the model does it
-/looprunner keep my tests green on X and fix failures -> the model does it
-/looprunner why did it stop / undo the last change    -> the model does it
-```
-
-Requires `plugins.entries.looprunner.allow_gateway_injection: true` in `config.yaml`;
-without it the handler falls back to returning the handoff prompt as text.
+There is deliberately **no `/looprunner` slash command**. A plugin slash command is a
+deterministic surface (the bundled `disk-cleanup` and `advanced-delegation` plugins both
+parse a fixed subcommand table), and routing free text through the model would require
+`ctx.inject_message` — a host API intended for external feeds such as webhooks and
+bridges, disabled by default, and absent from the capability registry. Chat is the right
+place for intent: the bundled skill plus the tool descriptions let the model interpret a
+request directly.
 
 ## Install
 
