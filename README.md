@@ -71,10 +71,45 @@ test: the loop only completes when it exits 0, not merely when the verify comman
 ## Security gate
 
 `loop_security(loop_id=...)` reviews the pending change set (staged, unstaged and untracked)
-with the host LLM and returns typed findings. `loop_commit(security_gate=True)` — or
-`security_gate: true` on the loop — refuses to open a PR when a **critical** or **high**
-finding is present. Untracked files are read directly, so a secret committed as a *new* file
-is still reviewed.
+and returns typed findings. Two engines:
+
+* `engine="llm"` (default) — a self-contained LLM review. Always available.
+* `engine="plugin"` — the **hermes-security** multi-agent diff scan, when that plugin is
+  loaded. `engine="auto"` (the default) prefers the plugin and falls back to the LLM review.
+
+Untracked files are read directly, so a secret committed as a *new* file is still reviewed.
+
+`loop_commit(security_gate=True)` refuses to open a PR when a **critical** or **high**
+finding is present.
+
+### Optional: the heavy scan
+
+The multi-agent scan is a multi-turn workflow (dispatch workers, wait, validate, finalize),
+so it cannot run inside a single tool call. Two ways to use it:
+
+```
+loop_security(loop_id=..., engine="plugin")   # starts the scan, hands back the driver steps
+loop_security_card(loop_id=...)               # hands the whole scan to a goal-mode card
+```
+
+The card carries the `security-diff-review` skill and drives the scan to completion, then
+reports MERGE or BLOCK.
+
+LoopRunner declares an **advisory** dependency:
+
+```yaml
+requires_plugins:
+  - id: hermes-security
+```
+
+That edge sets load order (hermes-security's `register()` runs first) and a missing
+dependency only logs a warning — the plugin probes with `ctx.has_plugin("hermes-security")`
+and degrades to the built-in review. To enable the heavy scan:
+
+```
+hermes plugins install hermes-security
+hermes plugins enable hermes-security
+```
 
 ## Usage
 
@@ -109,6 +144,10 @@ loop_watch(repo_path="/path/to/repo", interval_minutes=60, labels=["bug"])
 - Reads/writes state under the plugin data directory (`plugin-data/looprunner/`) only.
 - Spawns shell commands (your configured verify command) with the repository as cwd.
 - Creates git branches and opens PRs via the `gh` CLI.
+- Dispatches kanban cards via the `hermes kanban` CLI when watching issues or gating PRs.
+- Optionally depends on the `hermes-security` plugin (advisory `requires_plugins` edge);
+  when it is loaded, `loop_security` and `loop_security_card` call its tools through
+  `ctx.dispatch_tool`. Without it, the built-in LLM review is used.
 - No network calls to third-party services beyond git/gh.
 - No credentials stored; relies on Hermes's existing git/gh auth.
 - Long-running background process per active loop.

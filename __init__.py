@@ -76,6 +76,7 @@ def register(ctx):
         "loop_watch": _wrap("loop_watch"),
         "loop_scan_issues": _wrap("loop_scan_issues"),
         "loop_security": _wrap("loop_security"),
+        "loop_security_card": _wrap("loop_security_card"),
         "loop_checkpoint": _wrap("loop_checkpoint"),
     }
 
@@ -95,6 +96,7 @@ def register(ctx):
         "loop_watch": schemas.LOOP_WATCH,
         "loop_scan_issues": schemas.LOOP_SCAN_ISSUES,
         "loop_security": schemas.LOOP_SECURITY,
+        "loop_security_card": schemas.LOOP_SECURITY_CARD,
         "loop_checkpoint": schemas.LOOP_CHECKPOINT,
     }
 
@@ -137,4 +139,4 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register bundled skill: %s", e)
 
-    logger.info("LoopRunner plugin loaded (16 tools, 3 hooks)")
+    logger.info("LoopRunner plugin loaded (17 tools, 3 hooks)")

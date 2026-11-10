@@ -118,8 +118,30 @@ LOOP_SECURITY = {
     "name": "loop_security",
     "description": (
         "Security review of the loop's pending change set (staged + unstaged + untracked). "
-        "Returns typed findings and a 'blocking' flag for critical/high severity. "
-        "Use before loop_commit, or let loop_commit's security_gate do it."
+        "engine='llm' (default) is the self-contained review returning typed findings and "
+        "a 'blocking' flag for critical/high. engine='plugin' uses the hermes-security "
+        "multi-agent diff scan when that plugin is loaded; engine='auto' prefers it and "
+        "falls back to the LLM review. Use before loop_commit, or let loop_commit's "
+        "security_gate do it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id (empty = most recent)"},
+            "engine": {"type": "string", "enum": ["auto", "llm", "plugin"],
+                       "description": "auto (default) prefers hermes-security when loaded"},
+        },
+        "required": [],
+    },
+}
+
+LOOP_SECURITY_CARD = {
+    "name": "loop_security_card",
+    "description": (
+        "Dispatch a goal-mode kanban card that runs the hermes-security multi-agent diff "
+        "scan to completion. The heavy scan is a multi-turn workflow, so it cannot run "
+        "inside a single tool call -- this hands it to a card carrying the "
+        "security-diff-review skill. Requires the hermes-security plugin."
     ),
     "parameters": {
         "type": "object",

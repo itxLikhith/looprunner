@@ -134,6 +134,8 @@ def _migrate(raw):
         loop.setdefault("goal_max_turns", 20)
         loop.setdefault("seen_issues", {})
         loop.setdefault("watch_cards", [])
+        loop.setdefault("security_cards", [])
+        loop.setdefault("checkpoints", [])
         for entry in loop.get("history", []):
             entry.setdefault("attempt", entry.get("round", 0))
             entry.setdefault("duration_s", None)
@@ -1766,6 +1768,125 @@ def _collect_diff(repo_path):
     return (staged + "\n" + unstaged + new_content), untracked.strip(), files
 
 
+_SECURITY_INSTALL_HINT = (
+    "The hermes-security plugin is not loaded, so the multi-agent diff scan is "
+    "unavailable. Install it with: "
+    "hermes plugins install hermes-security && hermes plugins enable hermes-security"
+)
+
+
+def _security_has_plugin():
+    """Runtime probe for the advisory ``requires_plugins`` edge."""
+    try:
+        return _ctx is not None and bool(_ctx.has_plugin("hermes-security"))
+    except Exception:
+        return False
+
+
+def _security_start_scan(repo_path):
+    """Start a hermes-security diff scan via ``ctx.dispatch_tool``.
+
+    Returns (info, error). ``info`` carries the scan id and the first step; the
+    scan itself is agent-driven (dispatch workers, wait, validate, finalize), so
+    the caller either drives it with the security_scan_* tools or hands it to a
+    card carrying the security-diff-review skill.
+    """
+    if not _security_has_plugin():
+        return None, _SECURITY_INSTALL_HINT
+    git = _git_path()
+    _rc, head = _run([git, "rev-parse", "HEAD"], cwd=repo_path, timeout=20)
+    head = head.strip()
+    _rc2, merge_base = _run([git, "merge-base", "HEAD", "origin/HEAD"],
+                            cwd=repo_path, timeout=20)
+    args = {"path": repo_path, "mode": "diff"}
+    # The scan refuses an explicit head when the worktree is not the clean
+    # checked-out revision; with a dirty tree, let it pick the base itself.
+    _rcd, dirty = _run([git, "status", "--porcelain"], cwd=repo_path, timeout=20)
+    if head and not dirty.strip():
+        args["head"] = head
+    if _rc2 == 0 and merge_base.strip():
+        args["base"] = merge_base.strip()
+    try:
+        raw = _ctx.dispatch_tool("security_scan_start", args)
+    except Exception as e:
+        return None, "security_scan_start failed: %s" % e
+    try:
+        started = json.loads(raw)
+    except Exception:
+        return None, "unparseable security_scan_start result: %s" % (raw or "")[:300]
+    # dispatch_tool wraps handler output: {"ok": true, "result": {...}}
+    payload = started.get("result") if isinstance(started.get("result"), dict) else started
+    if started.get("ok") is False:
+        return None, "scan refused: %s" % json.dumps(started.get("error") or payload)[:300]
+    scan_id = payload.get("scanId") or payload.get("scan_id")
+    if not scan_id:
+        return None, "scan did not start: %s" % json.dumps(payload)[:300]
+    nxt = None
+    try:
+        nxt_raw = _ctx.dispatch_tool(
+            "security_scan_get", {"scan_id": scan_id, "section": "next"})
+        nxt_parsed = json.loads(nxt_raw)
+        nxt = nxt_parsed.get("result") if isinstance(nxt_parsed.get("result"), dict) else nxt_parsed
+    except Exception:
+        nxt = None
+    return {"scanId": scan_id, "root": payload.get("root"), "next": nxt}, None
+
+
+def loop_security_card(args, **kwargs):
+    """Dispatch a goal-mode kanban card that runs the hermes-security diff scan.
+
+    The heavy scan is a multi-turn workflow (dispatch workers, wait, validate,
+    finalize), so it cannot run inside a single tool call. This card carries the
+    ``security-diff-review`` skill and drives the scan to completion, then reports
+    findings and either opens the PR or blocks it.
+    """
+    loop_id = (args.get("loop_id") or "").strip()
+    state = _load_state()
+    loop = _resolve_loop(state.get("loops", {}), loop_id)
+    if not loop:
+        return _err("no loop found")
+    if not _security_has_plugin():
+        return json.dumps({
+            "loop_id": loop["id"], "card": None, "engine": "plugin",
+            "note": _SECURITY_INSTALL_HINT,
+            "message": "Cannot dispatch a security scan card without hermes-security.",
+        })
+
+    repo_path = loop["repo_path"]
+    git = _git_path()
+    _rc, head = _run([git, "rev-parse", "HEAD"], cwd=repo_path, timeout=20)
+    body = (
+        "Run a security review of the pending change set in %s and decide whether "
+        "it is safe to merge.\n\n"
+        "Repository: %s\nLoop: %s\nHEAD: %s\n\n"
+        "Use the security-diff-review skill: security_scan_start with mode \"diff\", "
+        "then drive the scan with security_scan_get / security_scan_submit_worker_result "
+        "until it is finalized. Read the findings section last.\n\n"
+        "Acceptance: every changed file is covered, findings are either resolved or "
+        "reported with evidence, and the card states MERGE or BLOCK with the reasons.\n"
+        % (repo_path, repo_path, loop["id"], (head or "").strip() or "unknown")
+    )
+    card_id, raw = _kanban_create(
+        "Security review: loop %s" % loop["id"],
+        body,
+        assignee=loop.get("assignee"),
+        goal=True,
+        goal_max_turns=loop.get("goal_max_turns", 40),
+        skills=["security-diff-review"],
+        priority=10,
+    )
+    cards = loop.get("security_cards") or []
+    cards.append({"card_id": card_id, "at": _now(), "head": (head or "").strip()})
+    loop["security_cards"] = cards
+    loop["updated_at"] = _now()
+    _save_state(state)
+    return json.dumps({
+        "loop_id": loop["id"], "engine": "plugin", "card": card_id,
+        "message": ("Security review card %s dispatched with the security-diff-review "
+                    "skill." % card_id) if card_id else "Card creation failed.",
+    })
+
+
 def loop_security(args, **kwargs):
     """Security review of the loop's pending change set.
 
@@ -1779,6 +1900,38 @@ def loop_security(args, **kwargs):
     if not loop:
         return _err("no loop found")
     repo_path = loop["repo_path"]
+
+    # engine: "plugin" uses hermes-security's multi-agent diff scan; "llm" (the
+    # default) is the self-contained review. "auto" prefers the plugin when it is
+    # loaded and falls back to the LLM review otherwise.
+    engine = (args.get("engine") or "auto").strip()
+    if engine in ("auto", "plugin"):
+        scan, err = _security_start_scan(repo_path)
+        if scan is not None:
+            return json.dumps({
+                "loop_id": loop["id"], "engine": "plugin", "scan": scan,
+                "findings": None, "blocking": False,
+                "message": (
+                    "hermes-security diff scan %s started. It is a multi-turn "
+                    "workflow: drive it with security_scan_get / "
+                    "security_scan_submit_worker_result, then finalize and read "
+                    "section='findings'. Alternatively call loop_security_card to "
+                    "hand the whole scan to a goal-mode card."
+                    % scan["scanId"]
+                ),
+            })
+        if engine == "plugin":
+            out = {
+                "loop_id": loop["id"], "engine": "plugin", "findings": None,
+                "blocking": False, "note": err,
+                "message": ("The heavy scan is unavailable (%s). The built-in LLM "
+                            "review is still available with engine='llm'." % err),
+            }
+            if not _security_has_plugin():
+                out["install"] = _SECURITY_INSTALL_HINT
+            return json.dumps(out)
+        # auto: fall through to the LLM review, but say so.
+
     patch, untracked, files = _collect_diff(repo_path)
     if not patch.strip() and not untracked:
         return json.dumps({

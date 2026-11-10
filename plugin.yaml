@@ -1,5 +1,5 @@
 name: looprunner
-version: "0.9.0"
+version: "0.10.0"
 description: >-
   Set-and-forget autonomous QA loop runner for any repo: runs your verify command,
   diagnoses failures with the host LLM, fixes the source on a branch, opens a PR,
@@ -11,6 +11,11 @@ license: MIT
 homepage: https://github.com/itxLikhith/looprunner
 tags: [automation, kanban, loop, qa, autonomous, testing, ci, security, issues]
 requires_hermes: ">=0.22.0"
+# Advisory inter-plugin dependency: load order honors this edge, and a missing
+# dependency only logs a warning. The plugin probes at runtime with
+# ctx.has_plugin("hermes-security") and falls back to its built-in LLM review.
+requires_plugins:
+  - id: hermes-security
 provides_tools:
   - loop_start
   - loop_tick
@@ -23,6 +28,7 @@ provides_tools:
   - loop_watch
   - loop_scan_issues
   - loop_security
+  - loop_security_card
   - loop_checkpoint
   - loop_recommend
   - loop_pause

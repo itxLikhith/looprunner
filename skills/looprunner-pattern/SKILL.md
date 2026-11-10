@@ -87,7 +87,15 @@ failures, fix, open PR, repeat — with hard budgets so it cannot run forever.
 
 * `loop_security(loop_id=...)` reviews the pending diff (staged + unstaged + untracked) and
   returns typed findings with a `blocking` flag for critical/high.
+  - `engine="llm"` (default) is self-contained.
+  - `engine="plugin"` uses the hermes-security multi-agent scan when that plugin is loaded;
+    `engine="auto"` (the default) prefers it and falls back.
 * `loop_commit(..., security_gate=True)` refuses to open a PR when blocking findings exist.
+* `loop_security_card(loop_id=...)` dispatches a goal-mode card carrying the
+  `security-diff-review` skill to drive the heavy scan to completion.
+* LoopRunner declares an advisory `requires_plugins: [hermes-security]` edge; a missing
+  dependency only logs a warning and the plugin probes with `ctx.has_plugin(...)`.
+  Install with `hermes plugins install hermes-security`.
 
 ## Auto-setup
 
