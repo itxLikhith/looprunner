@@ -221,9 +221,9 @@ def loop_tick(args, **kwargs):
             capture_output=True, text=True, timeout=timeout,
         )
         passed = (proc.returncode == 0)
-        output = (proc.stdout + chr(10) + proc.stderr).strip()
+        output = (proc.stdout + "\n" + proc.stderr).strip()
         if len(output) > 4000:
-            output = output[:2000] + chr(10) + '...[truncated]...' + chr(10) + output[-2000:]
+            output = output[:2000] + "\n" + '...[truncated]...' + "\n" + output[-2000:]
     except subprocess.TimeoutExpired:
         passed = False
         output = f'verify command timed out ({timeout}s)'
@@ -310,6 +310,30 @@ def loop_status(args, **kwargs):
     })
 
 
+def _cron_action(cron_id, action):
+    """Pause or resume the loop's cron job. Returns True on success."""
+    if not cron_id or cron_id == "created":
+        return False
+    try:
+        import subprocess, shutil, os
+        hermes_bin = shutil.which("hermes")
+        if not hermes_bin:
+            for candidate in [
+                os.path.join(os.path.expanduser("~"), ".hermes", "hermes-agent", ".hermes", "bin", "hermes"),
+                os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes", "hermes-agent", ".hermes", "bin", "hermes"),
+            ]:
+                if os.path.exists(candidate):
+                    hermes_bin = candidate
+                    break
+        if not hermes_bin:
+            return False
+        proc = subprocess.run([hermes_bin, "cron", action, cron_id],
+                              capture_output=True, text=True, timeout=15)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def _set_status(args, new_status):
     loop_id = (args.get('loop_id') or '').strip()
     state = _load_state()
@@ -321,24 +345,9 @@ def _set_status(args, new_status):
     if not loop:
         return json.dumps({'error': 'no loop found'})
     if new_status in ("stopped", "completed"):
-        cron_id = loop.get("cron_job_id")
-        if cron_id and cron_id != "created":
-            try:
-                import subprocess, shutil, os
-                hermes_bin = shutil.which("hermes")
-                if not hermes_bin:
-                    for candidate in [
-                        os.path.join(os.path.expanduser("~"), ".hermes", "hermes-agent", ".hermes", "bin", "hermes"),
-                        os.path.join(os.path.expanduser("~"), "AppData", "Local", "hermes", "hermes-agent", ".hermes", "bin", "hermes"),
-                    ]:
-                        if os.path.exists(candidate):
-                            hermes_bin = candidate
-                            break
-                if hermes_bin:
-                    subprocess.run([hermes_bin, "cron", "pause", cron_id],
-                                   capture_output=True, text=True, timeout=15)
-            except Exception:
-                pass
+        _cron_action(loop.get("cron_job_id"), "pause")
+    elif new_status == "running":
+        _cron_action(loop.get("cron_job_id"), "resume")
 
     loop["status"] = new_status
     loop["updated_at"] = _now()
@@ -379,7 +388,7 @@ def loop_recommend(args, **kwargs):
                 files.append(rel)
         if len(files) > 30:
             break
-    file_list = chr(10).join(files[:30])
+    file_list = "\n".join(files[:30])
 
     readme = ""
     for name in ("README.md", "README.rst", "README.txt"):
@@ -393,10 +402,10 @@ def loop_recommend(args, **kwargs):
 
     prompt = (
         "You are reviewing a software repository for improvements. "
-        "Repo: " + repo_path + chr(10) +
-        "Files:" + chr(10) + file_list + chr(10) + chr(10) +
-        "README (truncated):" + chr(10) + readme + chr(10) + chr(10) +
-        "Goal: " + (loop.get("goal", "improve quality")) + chr(10) + chr(10) +
+        "Repo: " + repo_path + "\n" +
+        "Files:" + "\n" + file_list + "\n" + "\n" +
+        "README (truncated):" + "\n" + readme + "\n" + "\n" +
+        "Goal: " + (loop.get("goal", "improve quality")) + "\n" + "\n" +
         "Suggest 3-5 concrete, actionable improvements. "
         "For each: title, why it matters, estimated effort (S/M/L), and a one-line fix sketch. "
         "Return as a JSON array of objects with keys: title, why, effort, fix. "

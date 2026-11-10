@@ -85,7 +85,11 @@ def register(ctx):
 
     # Register auxiliary task for LLM access (enables ctx.llm.complete with task=)
     try:
-        ctx.register_auxiliary_task("looprunner_review", "LoopRunner review", "code review and improvement suggestions")
+        ctx.register_auxiliary_task(
+            "looprunner_review",
+            display_name="LoopRunner review",
+            description="code review and improvement suggestions",
+        )
     except Exception as e:
         logger.warning("Could not register auxiliary task: %s", e)
 
@@ -106,9 +110,11 @@ def register(ctx):
     # Bundle the loop pattern skill
     try:
         import os
-        skill_path = os.path.join(os.path.dirname(__file__), "skills", "looprunner-pattern")
+        skill_path = os.path.join(
+            os.path.dirname(__file__), "skills", "looprunner-pattern", "SKILL.md"
+        )
         ctx.register_skill("looprunner-pattern", skill_path)
     except Exception as e:
         logger.warning("Could not register bundled skill: %s", e)
 
-    logger.info("LoopRunner plugin loaded (5 tools, 2 hooks)")
+    logger.info("LoopRunner plugin loaded (8 tools, 2 hooks)")
