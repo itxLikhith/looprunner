@@ -1,23 +1,31 @@
 name: looprunner
-version: "0.7.2"
-description: Generalized set-and-forget autonomous loop runner for any repo
+version: "0.8.0"
+description: >-
+  Set-and-forget autonomous QA loop runner for any repo: runs your verify command,
+  diagnoses failures with the host LLM, fixes the source on a branch, opens a PR,
+  and stops itself when it stalls or runs out of budget.
 author: Likhith Sai
 license: MIT
 homepage: https://github.com/itxLikhith/looprunner
-tags: [automation, kanban, loop, qa, autonomous]
+tags: [automation, kanban, loop, qa, autonomous, testing, ci]
 requires_hermes: ">=0.22.0"
 provides_tools:
   - loop_start
   - loop_tick
+  - loop_verify
+  - loop_status
+  - loop_history
+  - loop_analyze
   - loop_recommend
   - loop_commit
-  - loop_status
+  - loop_revert
   - loop_pause
   - loop_resume
   - loop_stop
 provides_hooks:
   - pre_llm_call
   - post_tool_call
+  - pre_tool_call
 capabilities: []
 config_schema:
   default_profile:
@@ -27,8 +35,24 @@ config_schema:
   max_rounds:
     type: int
     default: 10
-    description: "Max loop rounds before auto-pause"
+    description: "Max PASSING rounds before auto-pause"
+  max_attempts:
+    type: int
+    default: 20
+    description: "Max total verify runs before the loop gives up"
+  stall_threshold:
+    type: int
+    default: 3
+    description: "Same failure signature repeats before the loop stalls itself"
   verify_cmd:
     type: str
     default: ""
     description: "Verification command to run each round (e.g. cargo test -p gateway)"
+  auto_fix:
+    type: bool
+    default: false
+    description: "Reserved for future auto-fix rounds"
+  strict_git_guard:
+    type: bool
+    default: true
+    description: "Block direct git commit/push while a loop is active on main/master"

@@ -1,6 +1,5 @@
 """LoopRunner plugin — registration."""
 
-import json
 import logging
 
 from . import schemas, tools
@@ -17,6 +16,15 @@ def _on_post_tool_call(tool_name, args, result, task_id, **kwargs):
     logger.debug("Tool called: %s (session %s)", tool_name, task_id)
 
 
+def _on_pre_tool_call(tool_name, args, task_id, **kwargs):
+    """Safety gate: veto unsafe tool calls while a loop is running."""
+    try:
+        return tools.guard_tool_call(tool_name, args or {})
+    except Exception as e:
+        logger.debug("pre_tool_call guard failed: %s", e)
+        return None
+
+
 def _on_pre_llm_call(session_id, user_message, conversation_history,
                      is_first_turn, model, platform, **kwargs):
     state = tools._load_state()
@@ -25,7 +33,9 @@ def _on_pre_llm_call(session_id, user_message, conversation_history,
     if not active:
         return None
     summary = "Active LoopRunner loops: " + ", ".join(
-        f"{l['id']}({l['repo_path']}, round {l['round']})" for l in active
+        f"{l['id']}({l['repo_path']}, round {l.get('round', 0)}, "
+        f"attempts {l.get('attempts', 0)}, {l.get('status')})"
+        for l in active
     )
     return {"context": summary}
 
@@ -45,45 +55,46 @@ def register(ctx):
         args.setdefault("config", cfg)
         return tools.loop_start(args, **kwargs)
 
-    def _tick(args, **kwargs):
-        return tools.loop_tick(args or {}, **kwargs)
+    def _wrap(name):
+        def handler(args, **kwargs):
+            return getattr(tools, name)(args or {}, **kwargs)
+        return handler
 
-    def _status(args, **kwargs):
-        return tools.loop_status(args or {}, **kwargs)
+    _STATUS = {
+        "loop_start": _start,
+        "loop_tick": _wrap("loop_tick"),
+        "loop_verify": _wrap("loop_verify"),
+        "loop_status": _wrap("loop_status"),
+        "loop_history": _wrap("loop_history"),
+        "loop_analyze": _wrap("loop_analyze"),
+        "loop_pause": _wrap("loop_pause"),
+        "loop_resume": _wrap("loop_resume"),
+        "loop_stop": _wrap("loop_stop"),
+        "loop_recommend": _wrap("loop_recommend"),
+        "loop_commit": _wrap("loop_commit"),
+        "loop_revert": _wrap("loop_revert"),
+    }
 
-    def _pause(args, **kwargs):
-        return tools.loop_pause(args or {}, **kwargs)
+    _SCHEMAS = {
+        "loop_start": schemas.LOOP_START,
+        "loop_tick": schemas.LOOP_TICK,
+        "loop_verify": schemas.LOOP_VERIFY,
+        "loop_status": schemas.LOOP_STATUS,
+        "loop_history": schemas.LOOP_HISTORY,
+        "loop_analyze": schemas.LOOP_ANALYZE,
+        "loop_pause": schemas.LOOP_PAUSE,
+        "loop_resume": schemas.LOOP_RESUME,
+        "loop_stop": schemas.LOOP_STOP,
+        "loop_recommend": schemas.LOOP_RECOMMEND,
+        "loop_commit": schemas.LOOP_COMMIT,
+        "loop_revert": schemas.LOOP_REVERT,
+    }
 
-    def _resume(args, **kwargs):
-        return tools.loop_resume(args or {}, **kwargs)
+    for name, schema in _SCHEMAS.items():
+        ctx.register_tool(name=name, toolset="looprunner", schema=schema,
+                          handler=_STATUS[name])
 
-    def _stop(args, **kwargs):
-        return tools.loop_stop(args or {}, **kwargs)
-
-    def _recommend(args, **kwargs):
-        return tools.loop_recommend(args or {}, **kwargs)
-
-    def _commit(args, **kwargs):
-        return tools.loop_commit(args or {}, **kwargs)
-
-    ctx.register_tool(name="loop_start", toolset="looprunner",
-                      schema=schemas.LOOP_START, handler=_start)
-    ctx.register_tool(name="loop_tick", toolset="looprunner",
-                      schema=schemas.LOOP_TICK, handler=_tick)
-    ctx.register_tool(name="loop_status", toolset="looprunner",
-                      schema=schemas.LOOP_STATUS, handler=_status)
-    ctx.register_tool(name="loop_pause", toolset="looprunner",
-                      schema=schemas.LOOP_PAUSE, handler=_pause)
-    ctx.register_tool(name="loop_resume", toolset="looprunner",
-                      schema=schemas.LOOP_RESUME, handler=_resume)
-    ctx.register_tool(name="loop_stop", toolset="looprunner",
-                      schema=schemas.LOOP_STOP, handler=_stop)
-    ctx.register_tool(name="loop_recommend", toolset="looprunner",
-                      schema=schemas.LOOP_RECOMMEND, handler=_recommend)
-    ctx.register_tool(name="loop_commit", toolset="looprunner",
-                      schema=schemas.LOOP_COMMIT, handler=_commit)
-
-    # Register auxiliary task for LLM access (enables ctx.llm.complete with task=)
+    # Register auxiliary task for LLM access (enables ctx.llm with task=)
     try:
         ctx.register_auxiliary_task(
             "looprunner_review",
@@ -105,6 +116,7 @@ def register(ctx):
     tools.set_ctx(ctx)
 
     ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
 
     # Bundle the loop pattern skill
@@ -117,4 +129,4 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register bundled skill: %s", e)
 
-    logger.info("LoopRunner plugin loaded (8 tools, 2 hooks)")
+    logger.info("LoopRunner plugin loaded (12 tools, 3 hooks)")
