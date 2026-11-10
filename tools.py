@@ -310,6 +310,31 @@ def loop_status(args, **kwargs):
     })
 
 
+def _gh_path():
+    """Resolve the real gh.exe, not an MSYS bash shim.
+
+    ``subprocess.run([...])`` without a shell goes through ``CreateProcess``,
+    which cannot execute an extensionless bash shim. When Git Bash's bin dir is
+    on PATH, ``shutil.which("gh")`` returns exactly such a shim
+    (``/c/Program Files/GitHub CLI/gh``) and the PR step dies with WinError 2.
+    Prefer the known ``.exe`` install locations first.
+    """
+    import shutil, os
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    local_appdata = os.environ.get("LOCALAPPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+    for candidate in (
+        os.path.join(program_files, "GitHub CLI", "gh.exe"),
+        os.path.join(local_appdata, "GitHubCLI", "bin", "gh.exe"),
+        os.path.join(local_appdata, "Programs", "GitHub CLI", "gh.exe"),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    found = shutil.which("gh")
+    if found and found.lower().endswith(".exe") and os.path.isfile(found):
+        return found
+    return "gh"
+
+
 def _cron_action(cron_id, action):
     """Pause or resume the loop's cron job. Returns True on success."""
     if not cron_id or cron_id == "created":
@@ -492,7 +517,7 @@ def loop_commit(args, **kwargs):
                            capture_output=True, text=True, timeout=60)
         steps.append({"step": "push", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
 
-        r = subprocess.run(["gh", "pr", "create", "--title", pr_title, "--body", pr_body],
+        r = subprocess.run([_gh_path(), "pr", "create", "--title", pr_title, "--body", pr_body],
                            cwd=repo_path, capture_output=True, text=True, timeout=60)
         pr_url = r.stdout.strip() if r.returncode == 0 else ""
         steps.append({"step": "pr", "ok": r.returncode == 0, "out": (r.stdout + r.stderr).strip()})
