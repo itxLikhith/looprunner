@@ -11,7 +11,15 @@ LOOP_START = {
         "type": "object",
         "properties": {
             "repo_path": {"type": "string", "description": "Absolute path to the repository"},
-            "verify_cmd": {"type": "string", "description": "Verification command (overrides config)"},
+            "verify_cmd": {
+                "type": "string",
+                "description": (
+                    "Shell command that exits 0 on pass and non-zero on fail. "
+                    "Runs with the repository as cwd. On Windows, use "
+                    "'.venv\\Scripts\\python -m pytest -q' (backslashes) or quote "
+                    "the path; a bare forward-slash path is not resolved by cmd.exe."
+                )
+            },
             "max_rounds": {"type": "integer", "description": "Max rounds before auto-pause"},
             "goal": {"type": "string", "description": "What this loop should accomplish (e.g. 'ship v1.0')"},
             "deadline": {"type": "string", "description": "ISO date by which goal must be met (auto-disables after)"},
@@ -105,24 +113,7 @@ LOOP_COMMIT = {
             "pr_title": {"type": "string", "description": "PR title"},
             "pr_body": {"type": "string", "description": "PR body/description"},
         },
-        "required": ["commit_message"],
+        "required": [],
     },
 }
 
-LOOP_COMMIT = {
-    "name": "loop_commit",
-    "description": (
-        "Commit current changes to a branch and open a PR. Use after fixing a failure. "
-        "Creates branch auto/round-N, commits all changes, pushes, opens PR via gh."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "loop_id": {"type": "string", "description": "Loop id (empty = most recent)"},
-            "commit_message": {"type": "string", "description": "Commit message"},
-            "pr_title": {"type": "string", "description": "PR title"},
-            "pr_body": {"type": "string", "description": "PR body/description"},
-        },
-        "required": ["commit_message"],
-    },
-}
