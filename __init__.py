@@ -1,5 +1,6 @@
 """LoopRunner plugin — registration."""
 
+import json
 import logging
 
 from . import schemas, tools
@@ -150,8 +151,31 @@ def register(ctx):
             args = {"repo_path": rest} if verb in ("start", "run", "begin", "detect",
                                                    "inspect", "watch", "monitor") else {}
             return fn(args, **{})
-        # Not a verb: treat the whole thing as a repository reference.
-        return tools.loop_detect({"repo_path": raw}, **{})
+        # Not a recognised verb. Do NOT guess that it is a repository name --
+        # hand the raw text to the model, which knows the full tool surface and
+        # can decide what the user meant.
+        return _handoff_prompt(raw)
+
+
+    def _handoff_prompt(raw):
+        """Return a prompt the model can act on for unrecognised input."""
+        try:
+            names = ", ".join(sorted(_SCHEMAS))
+        except Exception:
+            names = "loop_start, loop_tick, loop_status, ..."
+        return json.dumps({
+            "handoff": True,
+            "user_input": raw,
+            "available_tools": names,
+            "instruction": (
+                "The user typed '/looprunner %s'. That is not a recognised verb and "
+                "not necessarily a repository name. Decide what they want from the "
+                "LoopRunner tool surface and act on it: start a loop, report status, "
+                "diagnose a failure, roll back a PR, review the diff for security, "
+                "watch the repository's issues, and so on. If you cannot tell, ask "
+                "one short question." % raw
+            ),
+        })
 
     try:
         ctx.register_command("looprunner", _slash_handler)

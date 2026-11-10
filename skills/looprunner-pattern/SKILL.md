@@ -17,14 +17,17 @@ tools, and only ask when the answer genuinely cannot be inferred.
 
 | The user says | Do |
 | --- | --- |
-| "keep my tests green on <repo>" / "keep fixing <repo>" | `loop_start` with that repo; let it auto-detect the verify command |
-| "<repo>" (just a name, no command) | `loop_detect(repo_path=<repo>)`, then `loop_start` with the recommended command |
+| "keep my tests green on \<repo\>" / "keep fixing \<repo\>" | `loop_start` with that repo; let it auto-detect the verify command |
+| "\<repo\>" (just a name, no command) | `loop_detect(repo_path=<repo>)`, then `loop_start` with the recommended command |
 | "is it running?" / "how's it going?" | `loop_status` — it returns a `next_action` |
 | "it's stuck" / "why did it stop" | `loop_status`, then `loop_analyze` |
 | "undo that last change" | `loop_revert` |
 | "pause/stop/resume it" | `loop_pause` / `loop_stop` / `loop_resume` |
 | "check it for security issues" | `loop_security` (or `loop_security_card` for the heavy scan) |
-| "watch the issues on <repo>" | `loop_watch` |
+| "watch the issues on \<repo\>" | `loop_watch` |
+
+The rows above are **examples of intent**, not an exhaustive grammar — the user may
+phrase any of these differently. Infer the goal, then pick the tool.
 
 Rules:
 
@@ -38,6 +41,8 @@ Rules:
 * **Report what you inferred.** "Started a loop on `colorama`, using `.venv/bin/python
   -m pytest -q`." — so the user can correct you.
 * If a tool returns an error, read its message: LoopRunner errors carry the fix.
+* The `/looprunner` slash command accepts a verb or a bare repository name. Anything else
+  comes back to you as a handoff prompt — decide what the user meant and act.
 
 ## Steps
 
@@ -54,6 +59,30 @@ Rules:
    * `loop_tick` again to confirm the pass.
 4. `loop_status` for state, `loop_history` for the full round log.
 5. Guard: never start a second round while one is still running.
+
+## Complete tool surface
+
+Everything LoopRunner can do. Use this as the map when the user's request does not
+obviously fit the flow above.
+
+| Tool | What it does |
+| --- | --- |
+| `loop_start` | Start a loop; auto-creates the cron job. Resolves repo names, auto-detects `verify_cmd` |
+| `loop_tick` | Run one verify round; records pass/fail, duration, failure signature |
+| `loop_verify` | Dry-run the verify command without recording a round |
+| `loop_status` | Round/attempt counts, budgets, signature, PRs, elapsed, and a `next_action` |
+| `loop_history` | Full round history |
+| `loop_analyze` | Structured LLM diagnosis: root cause, failing tests, files, fix, confidence, risk |
+| `loop_commit` | Branch + commit + push + PR. Refuses clean trees; `dry_run`, `security_gate` |
+| `loop_revert` | Close the last PR, delete its branch, return to the previous branch |
+| `loop_detect` | Resolve a repo reference and propose a verify command |
+| `loop_checkpoint` | Snapshot the current stage to a git branch + dirty-work patch |
+| `loop_watch` | Watch open issues; dispatch a goal-mode reproduction card per new issue |
+| `loop_scan_issues` | One watch pass (the watch cron calls this) |
+| `loop_security` | Security review of the pending diff; `engine=auto|llm|plugin` |
+| `loop_security_card` | Hand the heavy multi-agent security scan to a goal-mode card |
+| `loop_recommend` | LLM suggestions for the repository |
+| `loop_pause` / `loop_resume` / `loop_stop` | Control the loop and its cron |
 
 ## Budgets and stall detection
 
@@ -74,26 +103,6 @@ Rules:
 * Rust: `cargo test`
 * Node: `npm test`
 * Generic: any shell command that exits 0 on pass, non-zero on fail.
-
-## Safety rules
-
-* `loop_commit` is the only commit path — it creates a branch, commits, pushes, and opens
-  a PR. Direct `git commit`/`git push` are blocked by the `pre_tool_call` gate while a
-  loop is active on main/master or a loop branch.
-* Never auto-push to main/master. Branch + PR only.
-* Generated artifacts (`__pycache__`, `*.pyc`, `node_modules`, `dist`, `build`, `.venv`,
-  …) are excluded from both the diff gate and the commit.
-* `loop_commit` refuses to run when the work tree is clean — no empty commits.
-* `loop_revert` closes the last PR, deletes its branch and returns to the previous branch.
-* Never auto-approve unattended commands that need human approval.
-* Fail cleanly under cron/unattended runs.
-* Report bad news first.
-
-## Recommendations
-
-* `loop_recommend(loop_id=...)` analyzes the repo via the host LLM and returns numbered
-  improvements with effort estimates.
-* `loop_analyze` is the tool to reach for after a FAIL; it returns typed JSON.
 
 ## Goal resilience
 
@@ -117,7 +126,7 @@ Rules:
 
 * `loop_security(loop_id=...)` reviews the pending diff (staged + unstaged + untracked) and
   returns typed findings with a `blocking` flag for critical/high.
-  - `engine="llm"` (default) is self-contained.
+  - `engine="llm"` is self-contained.
   - `engine="plugin"` uses the hermes-security multi-agent scan when that plugin is loaded;
     `engine="auto"` (the default) prefers it and falls back.
 * `loop_commit(..., security_gate=True)` refuses to open a PR when blocking findings exist.
@@ -126,6 +135,26 @@ Rules:
 * LoopRunner declares an advisory `requires_plugins: [hermes-security]` edge; a missing
   dependency only logs a warning and the plugin probes with `ctx.has_plugin(...)`.
   Install with `hermes plugins install hermes-security`.
+
+## Safety rules
+
+* `loop_commit` is the only commit path — it creates a branch, commits, pushes, and opens
+  a PR. Direct `git commit`/`git push` are blocked by the `pre_tool_call` gate while a
+  loop is active on main/master or a loop branch.
+* Never auto-push to main/master. Branch + PR only.
+* Generated artifacts (`__pycache__`, `*.pyc`, `node_modules`, `dist`, `build`, `.venv`,
+  …) are excluded from both the diff gate and the commit.
+* `loop_commit` refuses to run when the work tree is clean — no empty commits.
+* `loop_revert` closes the last PR, deletes its branch and returns to the previous branch.
+* Never auto-approve unattended commands that need human approval.
+* Fail cleanly under cron/unattended runs.
+* Report bad news first.
+
+## Recommendations
+
+* `loop_recommend(loop_id=...)` analyzes the repo via the host LLM and returns numbered
+  improvements with effort estimates.
+* `loop_analyze` is the tool to reach for after a FAIL; it returns typed JSON.
 
 ## Auto-setup
 

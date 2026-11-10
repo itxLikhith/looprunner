@@ -51,17 +51,19 @@ The plugin is built to be driven by intent, not by memorised arguments:
 * Errors carry the fix, and `loop_status` returns a `next_action` telling the agent
   what to do next.
 
-The `/looprunner` slash command takes a verb or a bare repository name:
+The `/looprunner` slash command takes a verb, or hands the text to the model:
 
 ```
 /looprunner                       status
-/looprunner colorama-test         what is this repo and how do you test it?
 /looprunner start colorama-test   start a loop (auto-detects the verify command)
 /looprunner why                   diagnose the last failure
 /looprunner undo                  roll back the last PR
 /looprunner security              review the pending diff
 /looprunner pause|resume|stop     control the loop
 ```
+
+Anything else is handed to the model as a handoff prompt rather than guessed at — the
+model knows the full tool surface and decides what the user meant.
 
 ## Install
 
