@@ -413,14 +413,31 @@ def _cron_action(cron_id, action):
 # --------------------------------------------------------------------------- #
 
 def loop_start(args, **kwargs):
-    repo_path = (args.get("repo_path") or "").strip()
-    if not repo_path:
-        return _err("repo_path is required")
-    if not Path(repo_path).exists():
-        return _err("repo_path does not exist: %s" % repo_path)
+    raw_path = (args.get("repo_path") or "").strip()
+    repo_path, path_err = _resolve_repo(raw_path)
+    if path_err:
+        return _err(
+            "%s. Name the project instead of the full path, or run "
+            "loop_detect(repo_path=...) to check it." % path_err
+        )
 
     cfg = kwargs.get("config") or {}
     verify_cmd = (args.get("verify_cmd") or cfg.get("verify_cmd") or "").strip()
+    detected = []
+    detected_note = ""
+    if not verify_cmd:
+        # The user should not have to know the test command: read the project
+        # files and pick one.
+        detected = _detect_verify(repo_path)
+        best = detected[0] if detected else None
+        if best and best.get("cmd"):
+            verify_cmd = best["cmd"]
+            detected_note = "verify_cmd was not given; using `%s` (%s)." % (
+                best["cmd"], best.get("why"))
+        else:
+            detected_note = ("verify_cmd was not given and none could be detected. "
+                             "Ask the user which command checks this repository, then "
+                             "re-run loop_start with verify_cmd=...")
     max_rounds = args.get("max_rounds") or cfg.get("max_rounds") or 10
     max_attempts = args.get("max_attempts") or cfg.get("max_attempts") or 20
     stall_threshold = args.get("stall_threshold") or cfg.get("stall_threshold") or 3
@@ -545,7 +562,8 @@ def loop_start(args, **kwargs):
         "strict_git_guard": strict_git_guard,
         "verify_timeout": verify_timeout,
         "cron_job_id": cron_job_id,
-        "message": msg,
+        "detected_candidates": detected,
+        "message": (msg + (" " + detected_note if detected_note else "")).strip(),
     })
 
 
@@ -596,7 +614,11 @@ def loop_tick(args, **kwargs):
         loops = state.get("loops", {})
         loop = _resolve_loop(loops, loop_id, active_only=True)
         if not loop:
-            return _err("no active loop found")
+            return _err(
+                "No active loop. Start one with loop_start(repo_path=...) -- a "
+                "project name or relative path works, and verify_cmd may be "
+                "omitted (the plugin detects it). See loop_status for next steps."
+            )
         lid = loop["id"]
 
         if _deadline_passed(loop):
@@ -804,7 +826,10 @@ def loop_status(args, **kwargs):
     else:
         loop = _most_recent(loops)
         if not loop:
-            return _err("no loops found")
+            return _err(
+                "No loops yet. Say which repository to work on and call "
+                "loop_start(repo_path=...) -- a project name is enough."
+            )
 
     history = loop.get("history", [])
     created = loop.get("created_at")
@@ -816,6 +841,30 @@ def loop_status(args, **kwargs):
         pass
 
     last_sig = loop.get("last_signature")
+
+    # Tell the agent what to do next instead of making it infer from raw state.
+    last = history[-1] if history else None
+    status = loop["status"]
+    if status == "running":
+        if last and last.get("passed") is False:
+            next_action = ("Last verify FAILED. Run loop_analyze, apply the fix, then "
+                           "loop_verify, then loop_commit; then loop_tick again.")
+        elif loop.get("mode") == "watch":
+            next_action = ("Watch loop is running. Call loop_scan_issues now to scan "
+                           "immediately, or let the cron do it.")
+        else:
+            next_action = "Run loop_tick to advance the loop."
+    elif status == "paused":
+        next_action = "Loop is paused. loop_resume to continue or loop_stop to end it."
+    elif status == "stalled":
+        next_action = ("Loop stalled. Read the resume card that was dispatched, run "
+                       "loop_revert to roll back the last attempt, or loop_resume "
+                       "after changing the approach.")
+    elif status == "completed":
+        next_action = "Goal achieved — nothing further to do."
+    else:
+        next_action = "Loop is stopped. Start a new one with loop_start."
+
     return json.dumps({
         "loop_id": loop["id"],
         "status": loop["status"],
@@ -839,6 +888,7 @@ def loop_status(args, **kwargs):
         "signature_repeats": (loop.get("signature_counts") or {}).get(last_sig, 0) if last_sig else 0,
         "prs": loop.get("prs", []),
         "last_result": history[-1] if history else None,
+        "next_action": next_action,
         "rounds_completed": len([h for h in history if h.get("type") == "verify" and h.get("passed")]),
         "passes": len([h for h in history if h.get("passed") is True]),
         "fails": len([h for h in history if h.get("passed") is False]),
@@ -1346,6 +1396,168 @@ def loop_recommend(args, **kwargs):
     return json.dumps({
         "loop_id": loop["id"], "prompt": prompt,
         "note": "No LLM available -- analyze this prompt to get improvement recommendations.",
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Intent resolution: turn "that repo over there" into concrete arguments
+# --------------------------------------------------------------------------- #
+
+_PROJECT_ROOTS = (
+    "~/Documents/projects",
+    "~/Documents/hermes_plugin_dev",
+    "~/AppData/Local/hermes/cache/scratch",
+)
+
+
+def _resolve_repo(raw):
+    """Resolve a user-supplied repo reference.
+
+    Accepts an absolute path, a path relative to the Hermes cwd, ``~``, or a bare
+    name found under one of the common project roots. Returns ``(path, error)``.
+
+    The point is that a user should never have to know the absolute path: "start a
+    loop on my colour tools repo" is enough.
+    """
+    if not raw:
+        return os.getcwd(), None
+    expanded = os.path.expanduser(str(raw))
+    if os.path.isdir(expanded):
+        return os.path.abspath(expanded), None
+    # relative to the Hermes cwd
+    rel = os.path.join(os.getcwd(), expanded)
+    if os.path.isdir(rel):
+        return os.path.abspath(rel), None
+    # a bare project name under a common root
+    for root in (os.getcwd(),) + tuple(os.path.expanduser(r) for r in _PROJECT_ROOTS):
+        cand = os.path.join(root, expanded)
+        if os.path.isdir(cand):
+            return os.path.abspath(cand), None
+    # suggest the closest match so the caller can say "did you mean X?"
+    suggestions = []
+    for root in (os.getcwd(),) + tuple(os.path.expanduser(r) for r in _PROJECT_ROOTS):
+        try:
+            for entry in os.listdir(root):
+                cand = os.path.join(root, entry)
+                if (os.path.isdir(cand)
+                        and entry.lower().startswith(os.path.basename(expanded).lower()[:3])):
+                    suggestions.append(cand)
+        except Exception:
+            continue
+    return None, ("no such directory: %s"
+                  % raw + (" (did you mean: %s?)" % ", ".join(suggestions[:3])
+                           if suggestions else ""))
+
+
+def _detect_verify(repo_path):
+    """Propose verify commands for a repository, best guess first.
+
+    The user should not have to know whether this is a uv project or a venv
+    project -- the plugin reads the project files and decides.
+    """
+    p = Path(repo_path)
+    sep = "\\" if os.name == "nt" else "/"
+    out = []
+
+    pkg = p / "package.json"
+    if pkg.is_file():
+        try:
+            scripts = json.loads(pkg.read_text(encoding="utf-8")).get("scripts") or {}
+        except Exception:
+            scripts = {}
+        if "test" in scripts:
+            out.append({"cmd": "npm test", "why": "package.json scripts.test", "confidence": "high"})
+        else:
+            out.append({"cmd": "npm test", "why": "package.json present, no test script",
+                        "confidence": "low"})
+        if (p / "bun.lockb").exists() or (p / "bun.lock").exists():
+            out.append({"cmd": "bun test", "why": "bun lockfile present", "confidence": "medium"})
+
+    pyproject = p / "pyproject.toml"
+    if pyproject.is_file() or (p / "setup.py").is_file() or (p / "setup.cfg").is_file():
+        has_pytest = False
+        try:
+            has_pytest = "pytest" in pyproject.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+        venv_py = "Scripts\\python.exe" if os.name == "nt" else "bin/python"
+        venv_found = False
+        for venv_dir in (".venv", "venv", ".venv-real"):
+            if (p / venv_dir / venv_py).exists():
+                out.append({
+                    "cmd": "%s%s%s -m pytest -q" % (venv_dir, sep, venv_py),
+                    "why": "%s virtual environment" % venv_dir,
+                    "confidence": "high",
+                })
+                venv_found = True
+                break
+        if not venv_found:
+            if (p / "uv.lock").exists():
+                out.append({"cmd": "uv run pytest -q", "why": "uv.lock present",
+                            "confidence": "high" if has_pytest else "medium"})
+            else:
+                out.append({"cmd": "python -m pytest -q",
+                            "why": "python project" + (" (pytest declared)" if has_pytest else ""),
+                            "confidence": "high" if has_pytest else "medium"})
+
+    try:
+        mf = (p / "Makefile").read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^test\s*:", mf, re.M):
+            out.append({"cmd": "make test", "why": "Makefile test target", "confidence": "high"})
+    except Exception:
+        pass
+
+    if (p / "Cargo.toml").is_file():
+        out.append({"cmd": "cargo test", "why": "Cargo.toml", "confidence": "high"})
+    if (p / "go.mod").is_file():
+        out.append({"cmd": "go test ./...", "why": "go.mod", "confidence": "high"})
+    if list(p.glob("*.csproj")) or list(p.glob("*.fsproj")):
+        out.append({"cmd": "dotnet test", "why": ".csproj/.fsproj present", "confidence": "high"})
+    if (p / "pom.xml").is_file():
+        out.append({"cmd": "mvn test", "why": "pom.xml", "confidence": "medium"})
+    if (p / "build.gradle").is_file() or (p / "build.gradle.kts").is_file():
+        out.append({"cmd": "./gradlew test", "why": "Gradle build file", "confidence": "medium"})
+    if (p / "Gemfile").is_file():
+        out.append({"cmd": "bundle exec rake test", "why": "Gemfile", "confidence": "medium"})
+    if (p / "composer.json").is_file():
+        out.append({"cmd": "composer test", "why": "composer.json", "confidence": "medium"})
+    if (p / "CMakeLists.txt").is_file():
+        out.append({"cmd": "cmake --build build && ctest --test-dir build --output-on-failure",
+                    "why": "CMakeLists.txt", "confidence": "medium"})
+
+    if not out:
+        out.append({
+            "cmd": "",
+            "why": "no recognised project files (no package.json, pyproject.toml, Cargo.toml, ...)",
+            "confidence": "none",
+            "note": "Ask the user for the command that checks this repository, then "
+                    "call loop_start with it.",
+        })
+    return out
+
+
+def loop_detect(args, **kwargs):
+    """Inspect a repository and propose a verify command.
+
+    Use this when the user names a repo but not how to test it. Resolves the
+    path, reads the project files, and returns ranked candidates.
+    """
+    raw = (args.get("repo_path") or "").strip()
+    resolved, err = _resolve_repo(raw)
+    if err or not resolved:
+        return _err(err or "could not resolve the repository path")
+    candidates = _detect_verify(resolved)
+    best = candidates[0] if candidates else None
+    return json.dumps({
+        "repo_path": resolved,
+        "is_git": os.path.isdir(os.path.join(resolved, ".git")),
+        "candidates": candidates,
+        "recommended": best.get("cmd") if best else "",
+        "message": (
+            "Best guess: `%s` (%s)." % (best.get("cmd"), best.get("why"))
+            if best and best.get("confidence") != "none"
+            else "Could not detect a verify command automatically."
+        ),
     })
 
 

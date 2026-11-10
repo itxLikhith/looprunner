@@ -78,6 +78,7 @@ def register(ctx):
         "loop_security": _wrap("loop_security"),
         "loop_security_card": _wrap("loop_security_card"),
         "loop_checkpoint": _wrap("loop_checkpoint"),
+        "loop_detect": _wrap("loop_detect"),
     }
 
     _SCHEMAS = {
@@ -98,6 +99,7 @@ def register(ctx):
         "loop_security": schemas.LOOP_SECURITY,
         "loop_security_card": schemas.LOOP_SECURITY_CARD,
         "loop_checkpoint": schemas.LOOP_CHECKPOINT,
+        "loop_detect": schemas.LOOP_DETECT,
     }
 
     for name, schema in _SCHEMAS.items():
@@ -114,9 +116,43 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register auxiliary task: %s", e)
 
-    # Register in-session slash command
+    # Register in-session slash command.
+    # Accepts a verb ("start", "stop", "tick", "why", ...) or a bare repository
+    # reference, so "/looprunner colorama" does something useful instead of
+    # demanding a loop_id.
+    _VERBS = {
+        "status": "loop_status", "state": "loop_status", "progress": "loop_status",
+        "how": "loop_status", "hows": "loop_status",
+        "start": "loop_start", "run": "loop_start", "begin": "loop_start",
+        "detect": "loop_detect", "inspect": "loop_detect",
+        "watch": "loop_watch", "monitor": "loop_watch",
+        "stop": "loop_stop", "halt": "loop_stop",
+        "pause": "loop_pause",
+        "resume": "loop_resume", "continue": "loop_resume",
+        "tick": "loop_tick", "advance": "loop_tick", "step": "loop_tick",
+        "analyze": "loop_analyze", "diagnose": "loop_analyze", "why": "loop_analyze",
+        "fix": "loop_analyze",
+        "revert": "loop_revert", "undo": "loop_revert", "rollback": "loop_revert",
+        "security": "loop_security", "audit": "loop_security",
+        "history": "loop_history", "log": "loop_history",
+        "checkpoint": "loop_checkpoint", "snapshot": "loop_checkpoint",
+    }
+
     def _slash_handler(raw_args: str):
-        return tools.loop_status({"loop_id": (raw_args or "").strip()}, **{})
+        raw = (raw_args or "").strip()
+        if not raw:
+            return tools.loop_status({}, **{})
+        parts = raw.split(None, 1)
+        verb = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if verb in _VERBS:
+            fn = getattr(tools, _VERBS[verb])
+            args = {"repo_path": rest} if verb in ("start", "run", "begin", "detect",
+                                                   "inspect", "watch", "monitor") else {}
+            return fn(args, **{})
+        # Not a verb: treat the whole thing as a repository reference.
+        return tools.loop_detect({"repo_path": raw}, **{})
+
     try:
         ctx.register_command("looprunner", _slash_handler)
     except Exception as e:
@@ -139,4 +175,4 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register bundled skill: %s", e)
 
-    logger.info("LoopRunner plugin loaded (17 tools, 3 hooks)")
+    logger.info("LoopRunner plugin loaded (18 tools, 3 hooks)")

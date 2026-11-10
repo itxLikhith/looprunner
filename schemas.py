@@ -80,6 +80,26 @@ LOOP_START = {
     },
 }
 
+LOOP_DETECT = {
+    "name": "loop_detect",
+    "description": (
+        "Inspect a repository and propose a verify command: reads package.json, "
+        "pyproject.toml, Cargo.toml, Makefile, go.mod and friends, and returns ranked "
+        "candidates with confidence. Use when the user names a repo but not how to "
+        "test it. Also resolves relative paths and bare project names."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "repo_path": {
+                "type": "string",
+                "description": "Absolute path, relative path, '~' path, or a bare project name",
+            },
+        },
+        "required": [],
+    },
+}
+
 LOOP_WATCH = {
     "name": "loop_watch",
     "description": (

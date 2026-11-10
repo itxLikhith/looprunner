@@ -10,10 +10,40 @@ description: "Use when running an autonomous set-and-forget QA loop over a repo.
 When the user wants continuous autonomous QA on a repository: run verify command, find
 failures, fix, open PR, repeat — with hard budgets so it cannot run forever.
 
+## Conversational use: infer, do not interrogate
+
+Users do not know the tool names or the exact arguments. Map what they *mean* onto the
+tools, and only ask when the answer genuinely cannot be inferred.
+
+| The user says | Do |
+| --- | --- |
+| "keep my tests green on <repo>" / "keep fixing <repo>" | `loop_start` with that repo; let it auto-detect the verify command |
+| "<repo>" (just a name, no command) | `loop_detect(repo_path=<repo>)`, then `loop_start` with the recommended command |
+| "is it running?" / "how's it going?" | `loop_status` — it returns a `next_action` |
+| "it's stuck" / "why did it stop" | `loop_status`, then `loop_analyze` |
+| "undo that last change" | `loop_revert` |
+| "pause/stop/resume it" | `loop_pause` / `loop_stop` / `loop_resume` |
+| "check it for security issues" | `loop_security` (or `loop_security_card` for the heavy scan) |
+| "watch the issues on <repo>" | `loop_watch` |
+
+Rules:
+
+* **Never ask for an absolute path.** `repo_path` accepts a project name, a relative
+  path, or `~`. Only ask which repository when the user has not implied one.
+* **Never ask for the verify command** when the project type is recognisable — omit it
+  and let `loop_start` detect it, or call `loop_detect` first if the user wants to see
+  the options.
+* **One question at a time.** If something is genuinely ambiguous, ask the single most
+  useful question and propose a default.
+* **Report what you inferred.** "Started a loop on `colorama`, using `.venv/bin/python
+  -m pytest -q`." — so the user can correct you.
+* If a tool returns an error, read its message: LoopRunner errors carry the fix.
+
 ## Steps
 
 1. `loop_start(repo_path=..., verify_cmd=...)` to begin. A cron job is auto-created at
-   `interval_minutes` (default 60m).
+   `interval_minutes` (default 60m). `repo_path` accepts a project name or relative path;
+   `verify_cmd` may be omitted and is detected from the project files.
 2. Each round: run `loop_tick`. It runs `verify_cmd` once and records the result.
    * PASS → `round` increments.
    * FAIL → the tool returns a failure **signature** and a `branch` name.

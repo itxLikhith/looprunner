@@ -34,8 +34,34 @@ when retrying is pointless:
 | `loop_watch` | Watch open issues and dispatch reproduction cards |
 | `loop_scan_issues` | One watch pass (called by the watch cron) |
 | `loop_security` | Security review of the pending diff |
+| `loop_security_card` | Hand the heavy security scan to a goal-mode card |
 | `loop_checkpoint` | Snapshot the current stage to a branch + patch |
+| `loop_detect` | Inspect a repo and propose a verify command |
 | `loop_pause` / `loop_resume` / `loop_stop` | Control the loop and its cron |
+
+## Talk to it, don't learn it
+
+The plugin is built to be driven by intent, not by memorised arguments:
+
+* `repo_path` accepts an **absolute path, a relative path, `~`, or a bare project
+  name** (`loop_start(repo_path="colorama-test")`). A wrong name comes back with
+  *"did you mean …?"*.
+* `verify_cmd` **may be omitted** — `loop_start` reads the project files and picks
+  one. `loop_detect(repo_path=...)` shows the ranked candidates if you want to choose.
+* Errors carry the fix, and `loop_status` returns a `next_action` telling the agent
+  what to do next.
+
+The `/looprunner` slash command takes a verb or a bare repository name:
+
+```
+/looprunner                       status
+/looprunner colorama-test         what is this repo and how do you test it?
+/looprunner start colorama-test   start a loop (auto-detects the verify command)
+/looprunner why                   diagnose the last failure
+/looprunner undo                  roll back the last PR
+/looprunner security              review the pending diff
+/looprunner pause|resume|stop     control the loop
+```
 
 ## Install
 
