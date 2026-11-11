@@ -37,6 +37,8 @@ when retrying is pointless:
 | `loop_security_card` | Hand the heavy security scan to a goal-mode card |
 | `loop_checkpoint` | Snapshot the current stage to a branch + patch |
 | `loop_detect` | Inspect a repo and propose a verify command |
+| `loop_approve` | Approve a loop command out of band, so unattended runs may execute it |
+| `loop_pending` | List loop commands still waiting for approval, with their rule keys |
 | `loop_pause` / `loop_resume` / `loop_stop` | Control the loop and its cron |
 
 ## Talk to it, don't learn it
@@ -77,6 +79,71 @@ request directly.
 hermes plugins install /path/to/looprunner
 hermes plugins enable looprunner
 ```
+
+## Command approval
+
+A loop runs its verify command on **every tick, including unattended cron runs**, so the
+command is approved once per (repository, command) through Hermes's own approval gate —
+the same prompt, allowlist and `/approve` flow as any other dangerous command. A command
+from a tool argument is never trusted implicitly; auto-detection is only a suggestion until
+approved.
+
+A loop running where no human can answer (cron, `hermes chat -q`, webhook) **refuses
+immediately** rather than blocking for the approval timeout — Hermes's
+`approvals.cron_mode` / `single_query_mode` / `unattended_mode` default to `deny`, and
+waiting would only delay the same refusal.
+
+### How to approve
+
+**1. Interactively** — start the loop from an interactive session and answer the prompt
+with `[a]lways`. The approval is remembered per (repository, command), so cron ticks then
+run it unattended.
+
+**2. From chat** — `/loop_approve <repo-path> <command...>`, or the `loop_approve` tool.
+`loop_pending` lists what is waiting, with rule keys.
+
+**3. From the card** — when a loop cannot reach a human it dispatches an **approval card**
+to the kanban board, so there is somewhere to answer it:
+
+```
+Task: Approve loop command: .venv/Scripts/python.exe -m pytest tests/ -q
+
+Approving is a standing grant. It allows this command to run unattended in this
+repository on every loop tick, including cron.
+
+  hermes kanban comment <card> approve
+  hermes kanban comment <card> deny
+```
+
+The next tick reads the decision before refusing, so the loop unblocks on its own. Only a
+comment starting with `approve` or `deny` counts — discussion on the card cannot silently
+grant a standing approval.
+
+**4. Check a verdict without running anything:**
+
+```
+hermes approvals test -- <command>
+```
+
+### Configuration
+
+```yaml
+command_allowlist:
+  - looprunner:<repo-hash>:<command-hash>   # a standing approval
+
+approvals:
+  mode: smart          # smart | manual | off
+  cron_mode: deny      # deny | approve — what cron does when no human can answer
+  single_query_mode: deny
+  unattended_mode: deny
+```
+
+`approvals.mode: off` is equivalent to `--yolo` and bypasses every approval check.
+
+> **Running a loop unattended and want prompts on your phone?** Connect a gateway platform
+> (Telegram, Discord, …) and set `security.approval.transport: ntfy` — the `ntfy-approval`
+> plugin delivers each prompt as a push notification with Approve once / session / always
+> buttons. That is a user-level setup and needs no plugin configuration.
 
 ## Issue-driven maintenance
 

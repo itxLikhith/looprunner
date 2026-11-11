@@ -82,6 +82,8 @@ obviously fit the flow above.
 | `loop_security` | Security review of the pending diff; `engine=auto|llm|plugin` |
 | `loop_security_card` | Hand the heavy multi-agent security scan to a goal-mode card |
 | `loop_recommend` | LLM suggestions for the repository |
+| `loop_approve` | Approve a loop command out of band (writes `command_allowlist`) |
+| `loop_pending` | List loop commands still waiting for approval, with rule keys |
 | `loop_pause` / `loop_resume` / `loop_stop` | Control the loop and its cron |
 
 ## Budgets and stall detection
@@ -149,6 +151,9 @@ obviously fit the flow above.
 * Never auto-approve unattended commands that need human approval.
 * Fail cleanly under cron/unattended runs.
 * Report bad news first.
+* When a command is refused on an unattended surface, say so plainly and point at the
+  approval card or `/loop_approve` — do not silently retry, and do not suggest editing
+  `approvals.mode` unless the user asks for the broader grant.
 
 ## Recommendations
 
