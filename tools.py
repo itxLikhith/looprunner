@@ -640,6 +640,9 @@ def loop_start(args, **kwargs):
             "branch_guard": branch_guard,
             "auto_recommend": auto_recommend,
             "auto_fix": auto_fix,
+            "autofix_card_after": int(args.get("autofix_card_after") or cfg.get("autofix_card_after") or 2),
+            "autofix_fail_streak": 0,
+            "autofix_card_id": None,
             "strict_git_guard": strict_git_guard,
             "verify_timeout": verify_timeout,
             "command_approved": bool(approved_cmd),
@@ -1069,6 +1072,7 @@ def loop_tick(args, **kwargs):
         # Self-driving: ask the model to fix the failure before reporting.
         # Without this the loop only ever reports and waits for an agent.
         autofix = None
+        autofix_card = None
         if loop.get("auto_fix", True):
             autofix = _autonomous_fix(loop, output, sig)
             entry["autofix"] = autofix
@@ -1085,6 +1089,22 @@ def loop_tick(args, **kwargs):
                 except Exception as e:
                     autofix["committed"] = False
                     autofix["commit_error"] = str(e)
+            else:
+                # Autofix changed nothing. Two in a row means the loop is
+                # churning -- escalate to a card instead of burning attempts.
+                streak = int(loop.get("autofix_fail_streak", 0)) + 1
+                loop["autofix_fail_streak"] = streak
+                threshold = int(loop.get("autofix_card_after", 2))
+                if threshold > 0 and streak >= threshold and not loop.get("autofix_card_id"):
+                    try:
+                        card_id, _raw = _create_autofix_card(
+                            loop, output, sig, loop["attempts"])
+                        loop["autofix_card_id"] = card_id
+                        autofix_card = card_id
+                    except Exception:
+                        autofix_card = None
+        if autofix and autofix.get("applied"):
+            loop["autofix_fail_streak"] = 0
 
         if repeat >= int(loop.get("stall_threshold", 3)):
             loop["status"] = "stalled"
@@ -1152,6 +1172,7 @@ def loop_tick(args, **kwargs):
             "error_line": entry.get("error_line"),
             "duration_s": duration,
             "autofix": autofix,
+            "autofix_card": autofix_card,
             "branch": current_branch,
             "message": (
                 "Verify failed (attempt %d, signature %s seen %dx)%s. "
@@ -2246,6 +2267,48 @@ def _create_resume_card(loop, reason):
         skills=["looprunner-pattern"],
     )
     return card_id, raw
+
+
+def _create_autofix_card(loop, output, sig, attempts):
+    """Escalate a loop whose autofix keeps failing.
+
+    Two consecutive autofix attempts that changed nothing (or made no
+    difference) mean the loop is churning. A card lets a human or another
+    agent take over instead of the loop burning its attempt budget.
+    """
+    err = _first_error_line(output) or "(no error line extracted)"
+    body = (
+        "LoopRunner loop %s has failed %d time(s) and its autonomous fix has "
+        "not resolved it.\n\n"
+        "Repository: %s\n"
+        "Verify command: %s\n"
+        "Failure signature: %s\n"
+        "Round / attempts: %s / %s\n\n"
+        "First error line:\n%s\n\n"
+        "Recent output (truncated):\n%s\n\n"
+        "The loop is still running and will keep trying until it stalls or "
+        "exhausts its attempt budget.\n\n"
+        "Your job (do NOT just retry blindly):\n"
+        "1. Read the loop state and the failure output.\n"
+        "2. Decide the single best next action: apply a fix the autofix missed, "
+        "roll back the last attempt with loop_revert, or stop the loop.\n"
+        "3. Either apply that action, or leave a comment explaining the decision "
+        "and block this card.\n\n"
+        "Acceptance: a concrete decision has been made and either executed or "
+        "recorded with a reason."
+        % (
+            loop["id"], attempts, loop["repo_path"], loop.get("verify_cmd"),
+            sig, loop.get("round", 0), attempts, err, output[:3000],
+        )
+    )
+    return _kanban_create(
+        "Autofix stuck on loop %s" % loop["id"],
+        body,
+        assignee=loop.get("assignee"),
+        goal=True,
+        goal_max_turns=loop.get("goal_max_turns", 20),
+        skills=["looprunner-pattern"],
+    )
 
 
 def _ensure_retry_cron(loop, state):

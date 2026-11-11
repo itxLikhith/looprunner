@@ -45,6 +45,7 @@ LOOP_START = {
             "branch_guard": {"type": "boolean", "description": "Auto-create a working branch when on main/master (default true)"},
             "auto_recommend": {"type": "boolean", "description": "Suggest next improvements after each pass"},
             "auto_fix": {"type": "boolean", "description": "On failure, ask the model to apply a minimal fix and commit it (default true)"},
+            "autofix_card_after": {"type": "integer", "description": "Dispatch an escalation card after this many autofix attempts that changed nothing (default 2, 0 disables)"},
             "strict_git_guard": {
                 "type": "boolean",
                 "description": (

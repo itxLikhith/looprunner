@@ -75,8 +75,12 @@ config_schema:
     description: "Verification command to run each round (e.g. cargo test -p gateway)"
   auto_fix:
     type: bool
-    default: false
-    description: "Reserved for future auto-fix rounds"
+    default: true
+    description: "On failure, ask the model to apply a minimal fix and commit it"
+  autofix_card_after:
+    type: int
+    default: 2
+    description: "Dispatch an escalation card after N autofix attempts that changed nothing (0 disables)"
   strict_git_guard:
     type: bool
     default: true
