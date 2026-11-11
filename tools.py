@@ -2729,15 +2729,23 @@ def _is_trusted_author(repo_path, login):
             return True
     except Exception:
         pass
-    rc, out = _run([_gh_path(), "api",
-                    "repos/{owner}/{repo}/collaborators/{user}"
-                    % _repo_slug(repo_path),
-                    "--jq", ".role_name"], cwd=repo_path, timeout=60, env=_gh_env())
-    # 404 means "not a collaborator"; any other failure fails closed.
-    if rc == 0:
-        return True
-    if "404" in out or "Not Found" in out:
+    # _repo_slug returns (owner, repo); an empty owner means no origin remote.
+    owner, repo = _repo_slug(repo_path)
+    if not owner or not repo:
         return False
+    rc, out = _run([_gh_path(), "api",
+                    "repos/%s/%s/collaborators/%s" % (owner, repo, login),
+                    "--jq", ".role_name"], cwd=repo_path, timeout=60, env=_gh_env())
+    # The owner of a repo is not listed as a collaborator, so also accept an
+    # explicit admin/push permission on the repo itself.
+    if rc == 0 and out.strip():
+        return True
+    rc2, out2 = _run([_gh_path(), "api", "repos/%s/%s" % (owner, repo),
+                      "--jq", ".permissions.admin"], cwd=repo_path, timeout=60,
+                     env=_gh_env())
+    if rc2 == 0 and out2.strip() == "true" and login.lower() == owner.lower():
+        return True
+    # 404 means "not a collaborator"; any other failure fails closed.
     return False
 
 
