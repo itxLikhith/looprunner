@@ -81,6 +81,14 @@ config_schema:
     type: int
     default: 2
     description: "Dispatch an escalation card after N autofix attempts that changed nothing (0 disables)"
+  autofix_max_turns:
+    type: int
+    default: 8
+    description: "Max agent turns per autofix attempt"
+  autofix_budget:
+    type: int
+    default: 300
+    description: "Wall-clock seconds per autofix attempt"
   strict_git_guard:
     type: bool
     default: true

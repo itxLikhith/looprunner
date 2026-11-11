@@ -46,6 +46,8 @@ LOOP_START = {
             "auto_recommend": {"type": "boolean", "description": "Suggest next improvements after each pass"},
             "auto_fix": {"type": "boolean", "description": "On failure, ask the model to apply a minimal fix and commit it (default true)"},
             "autofix_card_after": {"type": "integer", "description": "Dispatch an escalation card after this many autofix attempts that changed nothing (default 2, 0 disables)"},
+            "autofix_max_turns": {"type": "integer", "description": "Max agent turns per autofix attempt (default 8)"},
+            "autofix_budget": {"type": "integer", "description": "Wall-clock seconds per autofix attempt (default 300)"},
             "strict_git_guard": {
                 "type": "boolean",
                 "description": (

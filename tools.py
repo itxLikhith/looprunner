@@ -23,6 +23,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -408,7 +409,14 @@ _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM", "TMPDIR",
 # prefix leaked config vars with no secret substring (HERMES_BASE_URL,
 # HERMES_KANBAN_DB, *_WEBHOOK), and TERMINAL_* describes the host's own
 # terminal backend, which a repo subprocess has no business reading.
-_UNSAFE_PREFIXES = ("HERMES_", "TERMINAL_")
+#
+# PYTHONPATH is dropped even though core's list includes it: the host's
+# PYTHONPATH points at Hermes's own source tree and plugin-host venv, so a repo
+# subprocess that inherits it resolves the repo's dependencies from the WRONG
+# place -- a repo's own 'click' was shadowed by a click in the host venv, and
+# its test suite ran against code that was never edited. Repo test code must
+# resolve imports from its own tree and venv, nothing else.
+_UNSAFE_PREFIXES = ("HERMES_", "TERMINAL_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
 # Non-secret runtime-location flags a child may read at import time.
 _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
@@ -1066,52 +1074,77 @@ def _guard_branch_switch(loop, current_branch):
 
 
 def _autonomous_fix(loop, output, signature):
-    """Ask the model to fix the failure and apply the patch.
+    """Fix the failure with a real agent turn, then report what changed.
 
     This is what makes a loop self-driving: without it, ``loop_tick`` only
-    reports a failure and waits for an agent to act on the message. Returns a
-    dict describing what happened; never raises.
-    """
-    if _ctx is None:
-        return {"applied": False, "reason": "no plugin context (ctx.llm unavailable)"}
+    reports a failure and waits for an agent to act on the message.
 
+    Uses ``hermes chat -q`` rather than ``ctx.llm.complete`` because the
+    latter is a single text completion with NO tools -- it cannot edit files,
+    so it always reported "no files changed". A CLI turn has the full toolset
+    (file read/write, terminal, search) and its own session, and works from
+    cron where no plugin context exists.
+
+    Returns a dict describing what happened; never raises.
+    """
     repo = loop["repo_path"]
     err = _first_error_line(output) or "(no error line extracted)"
     prompt = (
-        "A verification command failed in the repository at %s.\n\n"
-        "Verify command: %s\n\n"
-        "Failure signature: %s\n\n"
-        "First error line:\n%s\n\n"
-        "Full output (truncated):\n%s\n\n"
-        "Apply the minimal fix to the repository files. Use your file tools. "
-        "Do NOT run git commit, git push, or any git write command -- the loop "
-        "handles committing. Do NOT run the verify command yourself. Change "
-        "only what is needed to fix the failure."
-        % (repo, loop.get("verify_cmd"), signature, err, output[:6000])
+        "A verification command failed in the repository at {repo}.\n\n"
+        "Verify command: {cmd}\n\n"
+        "Failure signature: {sig}\n\n"
+        "First error line:\n{err}\n\n"
+        "Full output (truncated):\n{out}\n\n"
+        "Apply the minimal fix to the repository files.\n\n"
+        "Rules:\n"
+        "- Work only inside {repo}. Do not touch anything outside it.\n"
+        "- Do NOT run git commit, git push, git checkout, or any git write "
+        "command -- the loop handles committing and branching.\n"
+        "- Do NOT run the verify command yourself; the loop re-runs it.\n"
+        "- Change only what is needed to fix the reported failure.\n"
+        "- Prefer the smallest correct change over a refactor.\n"
+        .format(repo=repo, cmd=loop.get("verify_cmd"), sig=signature,
+                err=err, out=output[:6000])
     )
+
+    # Write the prompt to a file: --query-file passes arbitrary text verbatim,
+    # so quotes, $(...) and backticks in the failure output are never
+    # shell-interpreted.
+    query_path = None
     try:
-        _ctx.llm.complete(
-            messages=[
-                {"role": "system", "content": (
-                    "You are an autonomous software engineer fixing a failing check. "
-                    "Make the smallest change that fixes the reported failure. "
-                    "Never run git commit/push; never run the verify command."
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=2000, temperature=0.0, purpose="looprunner.autofix",
-        )
+        fd, query_path = tempfile.mkstemp(prefix="looprunner-fix-", suffix=".md")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
     except Exception as e:
-        return {"applied": False, "reason": "ctx.llm failed (%s: %s)" % (type(e).__name__, e)}
+        return {"applied": False, "reason": "could not write fix prompt: %s" % e}
+
+    try:
+        argv = [
+            _hermes_bin(), "chat", "--query-file", query_path,
+            "--oneshot", "--max-turns", str(int(loop.get("autofix_max_turns", 8))),
+            "--run-budget", str(int(loop.get("autofix_budget", 300))),
+            "--in", repo,
+        ]
+        rc, out_text = _run(argv, cwd=repo,
+                            timeout=int(loop.get("autofix_budget", 300)) + 120,
+                            env=_minimal_env())
+    except Exception as e:
+        return {"applied": False, "reason": "agent turn failed: %s" % e}
+    finally:
+        try:
+            os.unlink(query_path)
+        except Exception:
+            pass
 
     # Did the working tree actually change?
-    rc, status = _run([_git_path(), "status", "--porcelain"], cwd=repo,
-                      timeout=30, env=_git_env())
+    _rc, status = _run([_git_path(), "status", "--porcelain"], cwd=repo,
+                       timeout=30, env=_git_env())
     changed = [l for l in (status or "").splitlines() if l.strip() and not _is_artifact(l)]
     return {
         "applied": bool(changed),
         "changed_files": changed[:20],
-        "reason": "" if changed else "model returned but no files changed",
+        "agent_output": (out_text or "")[:1500],
+        "reason": "" if changed else "agent turn finished but no files changed",
     }
 
 
@@ -2719,14 +2752,32 @@ def _repo_slug(repo_path):
     return "", ""
 
 
+_PLUGIN_SETTING_KEYS = (
+    "verify_cmd", "goal_cmd", "max_rounds", "max_attempts", "stall_threshold",
+    "checkpoint_on_stall", "security_gate", "auto_fix", "autofix_card_after",
+    "strict_git_guard", "assignee", "goal_max_turns", "shard_index",
+    "shard_total", "default_profile", "issue_author_allowlist",
+)
+
+
 def _plugin_settings():
-    """This plugin's settings namespace (empty when no ctx is bound)."""
+    """This plugin's settings namespace (empty when no ctx is bound).
+
+    ``ctx.get_config(key, default)`` reads ONE key relative to
+    ``plugins.entries.<plugin>.settings``; there is no "return everything"
+    form, so each known setting is asked for by name.
+    """
     if _ctx is None:
         return {}
+    cfg = {}
     try:
-        return _ctx.get_config() or {}
+        for k in _PLUGIN_SETTING_KEYS:
+            v = _ctx.get_config(k)
+            if v is not None:
+                cfg[k] = v
     except Exception:
         return {}
+    return cfg
 
 
 def loop_scan_issues(args, **kwargs):

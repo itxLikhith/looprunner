@@ -61,10 +61,28 @@ def _on_pre_llm_call(session_id, user_message, conversation_history,
 
 
 def _get_config(ctx):
+    """Read this plugin's settings subtree.
+
+    ``ctx.get_config(key, default)`` reads one key relative to
+    ``plugins.entries.<plugin>.settings``. There is no "return everything"
+    form, so ask for each known setting and build the dict. Returns ``{}`` if
+    the surface is unavailable.
+    """
+    keys = (
+        "verify_cmd", "goal_cmd", "max_rounds", "max_attempts", "stall_threshold",
+        "checkpoint_on_stall", "security_gate", "auto_fix", "autofix_card_after",
+        "strict_git_guard", "assignee", "goal_max_turns", "shard_index",
+        "shard_total", "default_profile", "issue_author_allowlist",
+    )
+    cfg = {}
     try:
-        return ctx.get_config() or {}
+        for k in keys:
+            v = ctx.get_config(k)
+            if v is not None:
+                cfg[k] = v
     except Exception:
         return {}
+    return cfg
 
 
 def register(ctx):
