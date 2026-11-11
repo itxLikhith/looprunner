@@ -2133,6 +2133,14 @@ def _ci_test_commands(repo_path, limit=6):
                 continue
             if "${{" in cmd or "$" in cmd or "{{" in cmd:
                 continue  # templated; not runnable as-is
+            # A bare "tox" / "nox" / "pytest" token is usually a YAML mapping
+            # key ({name: ..., tox: random}), not a command. Require that a
+            # runner token be followed by a subcommand or a flag.
+            if re.fullmatch(r"(tox|nox|pytest|unittest|cargo|meson|ctest)", cmd):
+                continue
+            # YAML mapping syntax, not a shell command: "tox: random}", "key: value".
+            if re.match(r"^[\w.\-]+:\s", cmd) or cmd.endswith("}"):
+                continue
             if cmd.startswith(("pip ", "uv pip", "npm install", "npm ci",
                                "pnpm install", "yarn install", "apt ", "brew ")):
                 continue  # setup, not a check
