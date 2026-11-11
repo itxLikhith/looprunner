@@ -89,6 +89,14 @@ config_schema:
     type: int
     default: 20
     description: "Turn budget for goal-mode kanban cards"
+  shard_index:
+    type: int
+    default: 1
+    description: "Which shard this loop owns (1-based)"
+  shard_total:
+    type: int
+    default: 1
+    description: "Total shards; >1 adds sharding flags (pytest --splits/--group)"
   issue_author_allowlist:
     type: list
     default: []

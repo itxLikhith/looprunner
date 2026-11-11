@@ -586,7 +586,14 @@ def loop_start(args, **kwargs):
     auto_recommend = args.get("auto_recommend", cfg.get("auto_recommend", False))
     auto_fix = args.get("auto_fix", cfg.get("auto_fix", False))
     strict_git_guard = args.get("strict_git_guard", cfg.get("strict_git_guard", True))
-    verify_timeout = int(args.get("verify_timeout") or cfg.get("verify_timeout") or 300)
+    verify_timeout = args.get("verify_timeout") or cfg.get("verify_timeout")
+    shard_index = int(args.get("shard_index") or cfg.get("shard_index") or 1)
+    shard_total = int(args.get("shard_total") or cfg.get("shard_total") or 1)
+    if not verify_timeout:
+        # No explicit timeout: derive one from the command so a real suite does
+        # not get killed at the 300s default.
+        verify_timeout = _suggest_timeout(verify_cmd) if verify_cmd else 600
+    verify_timeout = int(verify_timeout)
     goal_cmd = (args.get("goal_cmd") or cfg.get("goal_cmd") or "").strip()
     checkpoint_on_stall = args.get("checkpoint_on_stall", cfg.get("checkpoint_on_stall", True))
     security_gate = args.get("security_gate", cfg.get("security_gate", False))
@@ -617,6 +624,8 @@ def loop_start(args, **kwargs):
             "verify_timeout": verify_timeout,
             "command_approved": bool(approved_cmd),
             "goal_cmd_approved": False,
+            "shard_index": shard_index,
+            "shard_total": shard_total,
             "goal_cmd": goal_cmd,
             "checkpoint_on_stall": checkpoint_on_stall,
             "security_gate": security_gate,
@@ -775,6 +784,10 @@ def _run_verify(loop):
             "refusing to run verify_cmd in an unattended run: it was never approved "
             "interactively. Start the loop from an interactive session."
         ), 0.0
+    # Own exactly one shard when the loop is configured to shard.
+    shard_total = int(loop.get("shard_total") or 1)
+    if shard_total > 1:
+        verify_cmd = _shard_flags(verify_cmd, int(loop.get("shard_index") or 1), shard_total)
     timeout = int(loop.get("verify_timeout", 300))
     start = time.time()
     try:
@@ -791,6 +804,34 @@ def _run_verify(loop):
         passed = False
         output = "verify command error: %s" % e
     return passed, output, round(time.time() - start, 2)
+
+
+def _dirty_paths(repo_path):
+    """Non-artifact paths with uncommitted changes (empty when clean)."""
+    rc, out = _run([_git_path(), "status", "--porcelain"], cwd=repo_path,
+                   timeout=30, env=_git_env())
+    if rc != 0:
+        return None  # unknown; caller must fail safe
+    return [l for l in out.splitlines() if l.strip() and not _is_artifact(l)]
+
+
+def _guard_branch_switch(loop, current_branch):
+    """Refuse to leave a branch with uncommitted work.
+
+    Switching branches under a developer's uncommitted edits can silently carry
+    them to another branch or block the checkout outright -- either way the
+    user's work is at risk. A loop must never do that.
+    """
+    dirty = _dirty_paths(loop["repo_path"])
+    if dirty is None:
+        return (False, "could not read git status; refusing to switch branches")
+    if dirty:
+        return (False,
+                "refusing to switch branches: %d uncommitted file(s) would be "
+                "affected, including %s. Commit, stash or revert them first -- "
+                "a loop must not move a developer's work."
+                % (len(dirty), ", ".join(dirty[:3])))
+    return True, ""
 
 
 def loop_tick(args, **kwargs):
@@ -824,12 +865,22 @@ def loop_tick(args, **kwargs):
                 "message": "Attempt budget exhausted. The loop stopped rather than retrying forever.",
             })
 
-        # Branch guard: never leave the loop sitting on main/master.
+        # Branch guard: never leave the loop sitting on main/master, and never
+        # move a developer's uncommitted work to do it.
         current_branch = _current_branch(loop["repo_path"])
         if loop.get("branch_guard", True) and current_branch in ("main", "master"):
+            ok, why = _guard_branch_switch(loop, current_branch)
+            if not ok:
+                _save_state(state)
+                return json.dumps({
+                    "loop_id": lid, "status": loop["status"],
+                    "round": loop.get("round", 0), "result": "BLOCKED",
+                    "branch": current_branch,
+                    "message": ("Branch guard stopped the round: %s" % why),
+                })
             work_branch = "looprunner/work-%d" % (loop.get("round", 0) + 1)
             rc, _out = _run([_git_path(), "checkout", "-b", work_branch],
-                            cwd=loop["repo_path"], timeout=30)
+                            cwd=loop["repo_path"], timeout=30, env=_git_env())
             if rc == 0:
                 current_branch = work_branch
 
@@ -1430,6 +1481,14 @@ def loop_commit(args, **kwargs):
         current = _current_branch(repo_path)
         branch = current if _is_loop_branch(current) else ("auto/round-%d" % (loop.get("round", 0) + 1))
         if branch != current:
+            # Never switch a branch out from under uncommitted work.
+            ok, why = _guard_branch_switch(loop, current)
+            if not ok:
+                return json.dumps({
+                    "loop_id": loop["id"], "committed": False,
+                    "reason": "branch guard: %s" % why,
+                    "message": ("Refusing to switch to %s: %s" % (branch, why)),
+                })
             rc, out = _run([git, "checkout", "-b", branch], cwd=repo_path, timeout=30, env=_git_env())
             if rc != 0:
                 rc2, out2 = _run([git, "checkout", branch], cwd=repo_path, timeout=30, env=_git_env())
@@ -1529,6 +1588,28 @@ def loop_revert(args, **kwargs):
         })
 
 
+def _walk_source_files(repo_path, extensions, cap=200, extra_skip=()):
+    """Walk a repo for source files without descending into heavy directories.
+
+    ``os.walk`` over a 1.5 GB repo (data/, weights/, node_modules/) is wasted
+    work and can take minutes. Skip anything git-ignored or obviously
+    generated, and stop at ``cap`` files.
+    """
+    skip = {".git", "__pycache__", "node_modules", ".venv", ".venv-real",
+            "dist", "build", "target", ".tox", ".mypy_cache", ".ruff_cache",
+            ".pytest_cache", "htmlcov", ".eggs", ".idea", ".vscode"}
+    skip.update(extra_skip)
+    out = []
+    for root, dirs, fnames in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in skip and not _is_artifact(d)]
+        for fn in fnames:
+            if fn.endswith(extensions) and not _is_artifact(fn):
+                out.append(os.path.relpath(os.path.join(root, fn), repo_path))
+                if len(out) >= cap:
+                    return out
+    return out
+
+
 def loop_recommend(args, **kwargs):
     """Suggest concrete improvements for the loop's repository."""
     loop_id = (args.get("loop_id") or "").strip()
@@ -1538,14 +1619,8 @@ def loop_recommend(args, **kwargs):
         return _err("no loop found")
 
     repo_path = loop["repo_path"]
-    files = []
-    for root, dirs, fnames in os.walk(repo_path):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "node_modules", ".venv", ".venv-real")]
-        for fn in fnames:
-            if fn.endswith((".py", ".yaml", ".yml", ".md", ".toml")):
-                files.append(os.path.relpath(os.path.join(root, fn), repo_path))
-        if len(files) > 30:
-            break
+    files = _walk_source_files(
+        repo_path, (".py", ".yaml", ".yml", ".md", ".toml"), cap=40)
 
     readme = ""
     for name in ("README.md", "README.rst", "README.txt"):
@@ -1653,15 +1728,112 @@ def _resolve_repo(raw):
                            if suggestions else ""))
 
 
+_CI_TEST_RE = re.compile(
+    r"(?P<cmd>"
+    r"(?:uv\s+run\s+)?(?:python\s+-m\s+)?pytest[^\n|&;]*"
+    r"|(?:python\s+-m\s+)?unittest[^\n|&;]*"
+    r"|(?:python\s+-m\s+)?tox[^\n|&;]*"
+    r"|(?:python\s+-m\s+)?nox[^\n|&;]*"
+    r"|cargo\s+test[^\n|&;]*"
+    r"|go\s+test[^\n|&;]*"
+    r"|(?:npm|yarn|pnpm)\s+(?:run\s+)?(?:test|unit|lint)[^\n|&;]*"
+    r"|(?:vitest|jest)[^\n|&;]*"
+    r"|meson\s+test[^\n|&;]*"
+    r"|ctest[^\n|&;]*"
+    r")"
+)
+
+
+def _read_ci_workflows(repo_path):
+    """Yield ``(path, text)`` for every CI workflow in the repo.
+
+    Covers GitHub Actions, GitLab CI, CircleCI, Travis, Azure Pipelines,
+    Bitbucket Pipelines, Jenkins and tox/nox config -- the systems a project
+    might actually use, not just GitHub.
+    """
+    p = Path(repo_path)
+    found = []
+    gh = p / ".github" / "workflows"
+    if gh.is_dir():
+        for f in sorted(gh.glob("*.y*ml")):
+            try:
+                found.append((str(f), f.read_text(encoding="utf-8", errors="replace")))
+            except Exception:
+                pass
+    for rel in (".gitlab-ci.yml", ".circleci/config.yml", ".travis.yml",
+                "azure-pipelines.yml", "bitbucket-pipelines.yml", "Jenkinsfile",
+                ".buildkite/pipeline.yml", "tox.ini", "noxfile.py"):
+        f = p / rel
+        if f.is_file():
+            try:
+                found.append((str(f), f.read_text(encoding="utf-8", errors="replace")[:20000]))
+            except Exception:
+                pass
+    return found
+
+
+def _ci_test_commands(repo_path, limit=6):
+    """Extract test commands from the repo's own CI configuration.
+
+    A project's CI is the authoritative answer to "how do I check this repo" --
+    far better than guessing ``pytest -q`` and accidentally running a 3571-test
+    suite serially. Returns ranked ``{"cmd", "why", "confidence"}`` dicts.
+    """
+    out = []
+    for path, text in _read_ci_workflows(repo_path):
+        name = os.path.basename(path)
+        for m in _CI_TEST_RE.finditer(text):
+            cmd = m.group("cmd").strip().strip('"').strip("'").strip()
+            # YAML block scalars wrap with a trailing backslash; drop it.
+            while cmd.endswith("\\"):
+                cmd = cmd[:-1].rstrip()
+            # Drop obvious non-starters and CI-only wrappers.
+            if not cmd or len(cmd) < 4 or len(cmd) > 300:
+                continue
+            if "${{" in cmd or "$" in cmd or "{{" in cmd:
+                continue  # templated; not runnable as-is
+            if cmd.startswith(("pip ", "uv pip", "npm install", "npm ci",
+                               "pnpm install", "yarn install", "apt ", "brew ")):
+                continue  # setup, not a check
+            if "coverage" in cmd and "pytest" not in cmd:
+                continue
+            if cmd.startswith("python -m pip") or " --fail-under" in cmd:
+                continue
+            # Normalise a bare `pytest ...` to an explicit interpreter when the
+            # project uses a venv.
+            if cmd.startswith("pytest "):
+                venv_py = "Scripts\\python.exe" if os.name == "nt" else "bin/python"
+                for vd in (".venv", "venv", ".venv-real"):
+                    if (Path(repo_path) / vd / venv_py).exists():
+                        cmd = "%s%s%s -m %s" % (vd, "\\" if os.name == "nt" else "/", venv_py, cmd)
+                        break
+                else:
+                    cmd = "python -m " + cmd
+            out.append({
+                "cmd": cmd,
+                "why": "from %s" % name,
+                "confidence": "high",
+            })
+            if len(out) >= limit:
+                return out
+    return out
+
+
 def _detect_verify(repo_path):
     """Propose verify commands for a repository, best guess first.
 
-    The user should not have to know whether this is a uv project or a venv
-    project -- the plugin reads the project files and decides.
+    Order: the repo's own CI configuration (authoritative), then project-type
+    heuristics. The user should not have to know whether this is a uv project
+    or a venv project -- the plugin reads the project files and decides.
     """
     p = Path(repo_path)
     sep = "\\" if os.name == "nt" else "/"
     out = []
+
+    # 1. CI config is the best evidence there is.
+    ci = _ci_test_commands(repo_path)
+    if ci:
+        out.extend(ci)
 
     pkg = p / "package.json"
     if pkg.is_file():
@@ -1740,6 +1912,44 @@ def _detect_verify(repo_path):
     return out
 
 
+def _shard_flags(cmd, shard_index, shard_total):
+    """Add sharding flags to a test command, matching its runner.
+
+    A loop on a large repo should be able to own ONE shard rather than run the
+    whole suite serially on a laptop. Returns the command unchanged when the
+    runner has no sharding support.
+    """
+    if shard_total <= 1:
+        return cmd
+    if "pytest" in cmd:
+        # pytest-xdist/pytest-split style. --splits/--group needs pytest-split;
+        # fall back to -n only when the user already has xdist.
+        if "--splits" in cmd:
+            return cmd
+        return cmd + " --splits %d --group %d" % (shard_total, shard_index)
+    if "cargo test" in cmd:
+        return cmd + " -- --test-threads=%d" % max(1, shard_total)
+    return cmd
+
+
+def _suggest_timeout(cmd, measured=None):
+    """A sane verify timeout for a command, in seconds.
+
+    The 300s default is too small for a real suite (RAVANA's CI-critical job
+    takes ~152s; a full unit shard would blow past it). Scale by what we know.
+    """
+    if measured:
+        # 3x headroom over the observed run, floored at 900s.
+        return max(900, int(measured * 3))
+    if "pytest" in cmd:
+        return 1800
+    if "cargo test" in cmd:
+        return 1800
+    if any(k in cmd for k in ("npm test", "yarn test", "pnpm test", "vitest", "jest")):
+        return 900
+    return 600
+
+
 def loop_detect(args, **kwargs):
     """Inspect a repository and propose a verify command.
 
@@ -1752,13 +1962,18 @@ def loop_detect(args, **kwargs):
         return _err(err or "could not resolve the repository path")
     candidates = _detect_verify(resolved)
     best = candidates[0] if candidates else None
+    # Suggest a timeout alongside the command: the 300s default is too small for
+    # a real suite, and a loop that times out every round just stalls.
+    suggested_timeout = _suggest_timeout(best.get("cmd")) if best else 600
     return json.dumps({
         "repo_path": resolved,
         "is_git": os.path.isdir(os.path.join(resolved, ".git")),
         "candidates": candidates,
         "recommended": best.get("cmd") if best else "",
+        "suggested_timeout": suggested_timeout,
         "message": (
-            "Best guess: `%s` (%s)." % (best.get("cmd"), best.get("why"))
+            "Best guess: `%s` (%s). Suggested verify_timeout: %ds."
+            % (best.get("cmd"), best.get("why"), suggested_timeout)
             if best and best.get("confidence") != "none"
             else "Could not detect a verify command automatically."
         ),
