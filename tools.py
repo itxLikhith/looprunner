@@ -572,6 +572,23 @@ def loop_start(args, **kwargs):
                 "approval_detail": approval_detail,
             })
         detected_note = (detected_note + " Approved.").strip()
+
+    # The goal command is a separate shell command and gets its own approval,
+    # once per (repo, command). Without this the loop can never reach
+    # goal_met=True and would burn its whole attempt budget on a blocked goal.
+    goal_approved = False
+    goal_approval_note = ""
+    if goal_cmd:
+        try:
+            goal_approved, goal_detail = _approve_command(repo_path, goal_cmd, "goal")
+        except Exception as e:
+            goal_approved, goal_detail = False, str(e)
+        if not goal_approved:
+            goal_approval_note = (
+                "goal_cmd was NOT approved (%s); the loop will not be able to "
+                "report the goal as met. Approve it interactively, or set it in "
+                "the plugin config." % goal_detail
+            )
     max_rounds = args.get("max_rounds") or cfg.get("max_rounds") or 10
     max_attempts = args.get("max_attempts") or cfg.get("max_attempts") or 20
     stall_threshold = args.get("stall_threshold") or cfg.get("stall_threshold") or 3
@@ -623,7 +640,7 @@ def loop_start(args, **kwargs):
             "strict_git_guard": strict_git_guard,
             "verify_timeout": verify_timeout,
             "command_approved": bool(approved_cmd),
-            "goal_cmd_approved": False,
+            "goal_cmd_approved": bool(goal_approved),
             "shard_index": shard_index,
             "shard_total": shard_total,
             "goal_cmd": goal_cmd,
@@ -697,7 +714,8 @@ def loop_start(args, **kwargs):
         "verify_timeout": verify_timeout,
         "cron_job_id": cron_job_id,
         "detected_candidates": detected,
-        "message": (msg + (" " + detected_note if detected_note else "")).strip(),
+        "message": (msg + (" " + detected_note if detected_note else "")
+                    + (" " + goal_approval_note if goal_approval_note else "")).strip(),
     })
 
 
@@ -907,30 +925,44 @@ def loop_tick(args, **kwargs):
                 # Same gate as verify_cmd: a goal command is a shell command and
                 # must be approved once per (repo, command).
                 if not loop.get("goal_cmd_approved"):
-                    g_passed, g_output, _g_dur = _run_verify({
-                        "verify_cmd": loop["goal_cmd"],
-                        "repo_path": loop["repo_path"],
-                        "verify_timeout": loop.get("verify_timeout", 300),
-                        "command_approved": False,
-                    })
-                    # _run_verify refuses unapproved commands, so treat that as
-                    # "goal not met" and say why.
-                    goal_met = False
+                    # A blocked goal is a CONFIGURATION error, not a test
+                    # failure: retrying cannot fix it. Stop now and say why,
+                    # instead of burning the whole attempt budget.
                     entry["goal_cmd"] = loop["goal_cmd"]
-                    entry["goal_output"] = (g_output or "")[:2000]
                     entry["goal_met"] = False
                     entry["goal_blocked"] = True
-                else:
-                    g_passed, g_output, _g_dur = _run_verify({
-                        "verify_cmd": loop["goal_cmd"],
-                        "repo_path": loop["repo_path"],
-                        "verify_timeout": loop.get("verify_timeout", 300),
-                        "command_approved": True,
+                    entry["goal_output"] = (
+                        "goal_cmd was never approved. The loop cannot report the "
+                        "goal as met until it is."
+                    )
+                    loop["history"].append(entry)
+                    loop["updated_at"] = _now()
+                    _finish_loop(loop, state, "goal_cmd not approved")
+                    return json.dumps({
+                        "loop_id": lid, "status": "completed",
+                        "round": loop.get("round", 0), "attempts": loop["attempts"],
+                        "result": "BLOCKED", "goal_blocked": True,
+                        "goal_cmd": loop["goal_cmd"],
+                        "reason": "goal_cmd not approved",
+                        "message": (
+                            "Stopped: goal_cmd was never approved, so the goal can "
+                            "never be met. The verify command passes, but the goal "
+                            "command is the acceptance test. Approve it "
+                            "interactively, or set it in the plugin config "
+                            "(plugins.entries.looprunner.settings.goal_cmd), then "
+                            "start a new loop."
+                        ),
                     })
-                    goal_met = bool(g_passed)
-                    entry["goal_cmd"] = loop["goal_cmd"]
-                    entry["goal_output"] = (g_output or "")[:2000]
-                    entry["goal_met"] = goal_met
+                g_passed, g_output, _g_dur = _run_verify({
+                    "verify_cmd": loop["goal_cmd"],
+                    "repo_path": loop["repo_path"],
+                    "verify_timeout": loop.get("verify_timeout", 300),
+                    "command_approved": True,
+                })
+                goal_met = bool(g_passed)
+                entry["goal_cmd"] = loop["goal_cmd"]
+                entry["goal_output"] = (g_output or "")[:2000]
+                entry["goal_met"] = goal_met
 
             loop["round"] = int(loop.get("round", 0)) + 1
             loop["last_signature"] = None
