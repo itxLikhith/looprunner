@@ -578,17 +578,6 @@ def loop_start(args, **kwargs):
     # goal_met=True and would burn its whole attempt budget on a blocked goal.
     goal_approved = False
     goal_approval_note = ""
-    if goal_cmd:
-        try:
-            goal_approved, goal_detail = _approve_command(repo_path, goal_cmd, "goal")
-        except Exception as e:
-            goal_approved, goal_detail = False, str(e)
-        if not goal_approved:
-            goal_approval_note = (
-                "goal_cmd was NOT approved (%s); the loop will not be able to "
-                "report the goal as met. Approve it interactively, or set it in "
-                "the plugin config." % goal_detail
-            )
     max_rounds = args.get("max_rounds") or cfg.get("max_rounds") or 10
     max_attempts = args.get("max_attempts") or cfg.get("max_attempts") or 20
     stall_threshold = args.get("stall_threshold") or cfg.get("stall_threshold") or 3
@@ -612,6 +601,20 @@ def loop_start(args, **kwargs):
         verify_timeout = _suggest_timeout(verify_cmd) if verify_cmd else 600
     verify_timeout = int(verify_timeout)
     goal_cmd = (args.get("goal_cmd") or cfg.get("goal_cmd") or "").strip()
+    # The goal command is a separate shell command and gets its own approval,
+    # once per (repo, command). Without this the loop can never reach
+    # goal_met=True and would burn its whole attempt budget on a blocked goal.
+    if goal_cmd:
+        try:
+            goal_approved, goal_detail = _approve_command(repo_path, goal_cmd, "goal")
+        except Exception as e:
+            goal_approved, goal_detail = False, str(e)
+        if not goal_approved:
+            goal_approval_note = (
+                "goal_cmd was NOT approved (%s); the loop will not be able to "
+                "report the goal as met. Approve it interactively, or set it in "
+                "the plugin config." % goal_detail
+            )
     checkpoint_on_stall = args.get("checkpoint_on_stall", cfg.get("checkpoint_on_stall", True))
     security_gate = args.get("security_gate", cfg.get("security_gate", False))
     mode = (args.get("mode") or "fix").strip()
