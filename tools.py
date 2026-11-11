@@ -764,6 +764,68 @@ def _finish_loop(loop, state, reason):
     return deleted
 
 
+def escalate_loop_command(tool_name, args):
+    """Escalate a loop's verify/goal command to Hermes's own approval gate.
+
+    This is the ``pre_tool_call`` half of the command-approval boundary. The
+    plugin does not implement approval: it returns ``{"action": "approve",
+    "message": ..., "rule_key": ...}`` and Hermes renders the prompt, persists
+    the allowlist and honours ``/approve`` -- exactly as it does for a
+    user-defined dangerous pattern.
+
+    Matching is by exact command string against the commands recorded on
+    active loops. A loop runs its command on every tick, so an approval is
+    good for the life of the loop; the rule_key is per (repo, command), which
+    is the grain the catalog review asked for.
+
+    Returns ``None`` when the call is not a loop command, so unrelated
+    terminal calls pass through untouched.
+    """
+    if tool_name not in ("terminal", "execute_code", "shell", "bash", "command"):
+        return None
+    cmd = args.get("command") or args.get("cmd") or args.get("code") or ""
+    if not isinstance(cmd, str) or not cmd.strip():
+        return None
+
+    try:
+        state = _load_state()
+    except Exception:
+        return None
+
+    for loop in (state.get("loops") or {}).values():
+        if loop.get("status") not in ("running", "paused"):
+            continue
+        for purpose, key in (("verify", "verify_cmd"), ("goal", "goal_cmd")):
+            recorded = (loop.get(key) or "").strip()
+            if not recorded:
+                continue
+            # Match the command the loop will actually run: the recorded
+            # command, or that command with sharding flags appended.
+            candidates = {recorded}
+            if int(loop.get("shard_total") or 1) > 1:
+                candidates.add(_shard_flags(
+                    recorded, int(loop.get("shard_index") or 1),
+                    int(loop.get("shard_total") or 1)))
+            if cmd.strip() not in candidates:
+                continue
+            rule_key = "looprunner:%s:%s" % (
+                hashlib.sha256(os.path.abspath(loop["repo_path"]).encode("utf-8")).hexdigest()[:16],
+                hashlib.sha256(recorded.encode("utf-8")).hexdigest()[:16],
+            )
+            return {
+                "action": "approve",
+                "message": (
+                    "LoopRunner loop %s wants to run this %s command in %s:\n\n"
+                    "    %s\n\n"
+                    "It runs on every loop tick, including unattended cron "
+                    "runs. Approve once to allow it for this repository."
+                    % (loop["id"], purpose, loop["repo_path"], recorded)
+                ),
+                "rule_key": rule_key,
+            }
+    return None
+
+
 def _surface_approval_mode():
     """Return ``(surface, mode)`` for the current process, or ``(None, None)``.
 
@@ -824,6 +886,27 @@ def _approve_command(repo_path, command, purpose):
             % (surface, surface, surface)
         )
 
+    # Preferred path: hand the decision to Hermes's own gate via the public
+    # pre_tool_call hook surface (the same mechanism a user-defined dangerous
+    # pattern uses). That keeps the prompt, allowlist and /approve flow in
+    # Hermes, and avoids touching private core APIs.
+    try:
+        verdict = escalate_loop_command("terminal", {"command": command})
+        if verdict and verdict.get("action") == "approve":
+            # The hook escalated; Hermes will prompt. Record that the command
+            # is pending rather than approved -- loop_tick still refuses it
+            # until an interactive approval lands.
+            return False, (
+                "command escalated to Hermes's approval gate; approve it "
+                "interactively to start the loop"
+            )
+    except Exception:
+        pass
+
+    # Fallback when the hook surface is unavailable (older Hermes, or a host
+    # that does not render plugin approval prompts). Uses the private
+    # tools.approval seam, which the catalog validator flags; it is imported
+    # lazily and any failure degrades to "refuse", never to "allow".
     rule_key = "looprunner:%s:%s" % (
         hashlib.sha256(os.path.abspath(repo_path).encode("utf-8")).hexdigest()[:16],
         hashlib.sha256(command.encode("utf-8")).hexdigest()[:16],

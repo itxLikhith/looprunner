@@ -17,11 +17,31 @@ def _on_post_tool_call(tool_name, args, result, task_id, **kwargs):
 
 
 def _on_pre_tool_call(tool_name, args, task_id, **kwargs):
-    """Safety gate: veto unsafe tool calls while a loop is running."""
+    """Safety gate: veto unsafe tool calls while a loop is running.
+
+    Two jobs, in order:
+
+    1. Escalate a loop's verify/goal command to Hermes's own approval gate.
+       A loop runs its command on every tick, including unattended cron runs,
+       so the command must be approved once per (repo, command) by a human.
+       Returning ``{"action": "approve", ...}`` hands the decision to Hermes --
+       the plugin implements no approval logic of its own, and the user gets
+       the same once/session/always/deny prompt, allowlist and /approve flow
+       as any other dangerous command.
+    2. Veto direct git writes while a loop is active on main/master.
+    """
     try:
-        return tools.guard_tool_call(tool_name, args or {})
+        verdict = tools.guard_tool_call(tool_name, args or {})
+        if verdict:
+            return verdict
     except Exception as e:
         logger.debug("pre_tool_call guard failed: %s", e)
+    try:
+        return tools.escalate_loop_command(tool_name, args or {})
+    except Exception as e:
+        # Hermes fails closed on hook exceptions, so a crash here would block
+        # EVERY terminal call rather than the one being matched.
+        logger.debug("pre_tool_call escalation failed: %s", e)
         return None
 
 
