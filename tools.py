@@ -590,7 +590,7 @@ def loop_start(args, **kwargs):
         interval = 60
     branch_guard = args.get("branch_guard", cfg.get("branch_guard", True))
     auto_recommend = args.get("auto_recommend", cfg.get("auto_recommend", False))
-    auto_fix = args.get("auto_fix", cfg.get("auto_fix", False))
+    auto_fix = args.get("auto_fix", cfg.get("auto_fix", True))
     strict_git_guard = args.get("strict_git_guard", cfg.get("strict_git_guard", True))
     verify_timeout = args.get("verify_timeout") or cfg.get("verify_timeout")
     shard_index = int(args.get("shard_index") or cfg.get("shard_index") or 1)
@@ -855,6 +855,56 @@ def _guard_branch_switch(loop, current_branch):
     return True, ""
 
 
+def _autonomous_fix(loop, output, signature):
+    """Ask the model to fix the failure and apply the patch.
+
+    This is what makes a loop self-driving: without it, ``loop_tick`` only
+    reports a failure and waits for an agent to act on the message. Returns a
+    dict describing what happened; never raises.
+    """
+    if _ctx is None:
+        return {"applied": False, "reason": "no plugin context (ctx.llm unavailable)"}
+
+    repo = loop["repo_path"]
+    err = _first_error_line(output) or "(no error line extracted)"
+    prompt = (
+        "A verification command failed in the repository at %s.\n\n"
+        "Verify command: %s\n\n"
+        "Failure signature: %s\n\n"
+        "First error line:\n%s\n\n"
+        "Full output (truncated):\n%s\n\n"
+        "Apply the minimal fix to the repository files. Use your file tools. "
+        "Do NOT run git commit, git push, or any git write command -- the loop "
+        "handles committing. Do NOT run the verify command yourself. Change "
+        "only what is needed to fix the failure."
+        % (repo, loop.get("verify_cmd"), signature, err, output[:6000])
+    )
+    try:
+        _ctx.llm.complete(
+            messages=[
+                {"role": "system", "content": (
+                    "You are an autonomous software engineer fixing a failing check. "
+                    "Make the smallest change that fixes the reported failure. "
+                    "Never run git commit/push; never run the verify command."
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=2000, temperature=0.0, purpose="looprunner.autofix",
+        )
+    except Exception as e:
+        return {"applied": False, "reason": "ctx.llm failed (%s: %s)" % (type(e).__name__, e)}
+
+    # Did the working tree actually change?
+    rc, status = _run([_git_path(), "status", "--porcelain"], cwd=repo,
+                      timeout=30, env=_git_env())
+    changed = [l for l in (status or "").splitlines() if l.strip() and not _is_artifact(l)]
+    return {
+        "applied": bool(changed),
+        "changed_files": changed[:20],
+        "reason": "" if changed else "model returned but no files changed",
+    }
+
+
 def loop_tick(args, **kwargs):
     loop_id = (args.get("loop_id") or "").strip()
     with _LoopLock(name=("loop-%s" % loop_id) if loop_id else "looprunner"):
@@ -910,6 +960,11 @@ def loop_tick(args, **kwargs):
             return _err(output)
 
         loop["attempts"] = int(loop.get("attempts", 0)) + 1
+        # A round is one pass/fix cycle, so it advances on EVERY attempt --
+        # including failures. Previously it only incremented on a pass, so a
+        # loop that kept failing stayed at round 0 forever while attempts
+        # climbed, making max_rounds meaningless.
+        loop["round"] = int(loop.get("round", 0)) + 1
         entry = {
             "attempt": loop["attempts"],
             "round": loop.get("round", 0),
@@ -967,13 +1022,11 @@ def loop_tick(args, **kwargs):
                 entry["goal_output"] = (g_output or "")[:2000]
                 entry["goal_met"] = goal_met
 
-            loop["round"] = int(loop.get("round", 0)) + 1
             loop["last_signature"] = None
             loop["signature_counts"] = {}
             entry["signature"] = None
             loop["history"].append(entry)
             loop["updated_at"] = _now()
-
             if goal_met and loop["round"] >= int(loop.get("max_rounds", 10)):
                 _finish_loop(loop, state, "goal achieved")
                 return json.dumps({
@@ -1012,6 +1065,26 @@ def loop_tick(args, **kwargs):
         loop["history"].append(entry)
         loop["updated_at"] = _now()
         repeat = counts[sig]
+
+        # Self-driving: ask the model to fix the failure before reporting.
+        # Without this the loop only ever reports and waits for an agent.
+        autofix = None
+        if loop.get("auto_fix", True):
+            autofix = _autonomous_fix(loop, output, sig)
+            entry["autofix"] = autofix
+            loop["history"][-1] = entry
+            if autofix.get("applied"):
+                # Commit the fix so the next tick verifies a clean change.
+                try:
+                    _run([_git_path(), "add", "-A"], cwd=loop["repo_path"],
+                         timeout=60, env=_git_env())
+                    _run([_git_path(), "commit", "-q", "-m",
+                          "looprunner: autofix for %s" % sig[:8]],
+                         cwd=loop["repo_path"], timeout=60, env=_git_env())
+                    autofix["committed"] = True
+                except Exception as e:
+                    autofix["committed"] = False
+                    autofix["commit_error"] = str(e)
 
         if repeat >= int(loop.get("stall_threshold", 3)):
             loop["status"] = "stalled"
@@ -1077,13 +1150,18 @@ def loop_tick(args, **kwargs):
             "stall_threshold": loop.get("stall_threshold", 3),
             "verify_cmd": loop.get("verify_cmd"), "output": output,
             "error_line": entry.get("error_line"),
-            "duration_s": duration, "branch": branch,
+            "duration_s": duration,
+            "autofix": autofix,
+            "branch": current_branch,
             "message": (
-                "Verify failed (attempt %d, signature %s seen %dx). Analyze the "
-                "output, apply a minimal fix, then use loop_commit with "
-                "branch='%s'. Do NOT run git commit/push directly. Re-run "
+                "Verify failed (attempt %d, signature %s seen %dx)%s. "
+                "Analyze the output, apply a minimal fix, then use loop_commit "
+                "with branch='%s'. Do NOT run git commit/push directly. Re-run "
                 "loop_tick to verify the fix."
-                % (loop["attempts"], sig, repeat, branch)
+                % (loop["attempts"], sig, repeat,
+                   ("; autofix applied to %d file(s)" % len(autofix.get("changed_files") or []))
+                   if autofix and autofix.get("applied") else "",
+                   branch)
             ),
         })
 
