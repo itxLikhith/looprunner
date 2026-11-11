@@ -27,6 +27,8 @@ provides_tools:
   - loop_revert
   - loop_watch
   - loop_scan_issues
+  - loop_approve
+  - loop_pending
   - loop_security
   - loop_security_card
   - loop_detect

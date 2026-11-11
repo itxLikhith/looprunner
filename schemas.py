@@ -345,3 +345,31 @@ LOOP_REVERT = {
         "required": [],
     },
 }
+
+LOOP_APPROVE = {
+    "name": "loop_approve",
+    "description": (
+        "Approve a loop's verify or goal command out of band, so cron and other "
+        "unattended runs may execute it. Records the per-(repo, command) rule key in "
+        "command_allowlist. Use when a loop refuses to start because no human could "
+        "answer the approval prompt."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "repo_path": {"type": "string", "description": "Repository the command runs in"},
+            "command": {"type": "string", "description": "The exact command to approve"},
+            "purpose": {"type": "string", "description": "verify or goal (default verify)"},
+        },
+        "required": ["repo_path", "command"],
+    },
+}
+
+LOOP_PENDING = {
+    "name": "loop_pending",
+    "description": (
+        "List loop commands that still need approval, with their rule keys and the "
+        "exact steps to approve them."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}

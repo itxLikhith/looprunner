@@ -113,6 +113,8 @@ def register(ctx):
         "loop_revert": _wrap("loop_revert"),
         "loop_watch": _wrap("loop_watch"),
         "loop_scan_issues": _wrap("loop_scan_issues"),
+        "loop_approve": _wrap("loop_approve"),
+        "loop_pending": _wrap("loop_pending"),
         "loop_security": _wrap("loop_security"),
         "loop_security_card": _wrap("loop_security_card"),
         "loop_checkpoint": _wrap("loop_checkpoint"),
@@ -134,6 +136,8 @@ def register(ctx):
         "loop_revert": schemas.LOOP_REVERT,
         "loop_watch": schemas.LOOP_WATCH,
         "loop_scan_issues": schemas.LOOP_SCAN_ISSUES,
+        "loop_approve": schemas.LOOP_APPROVE,
+        "loop_pending": schemas.LOOP_PENDING,
         "loop_security": schemas.LOOP_SECURITY,
         "loop_security_card": schemas.LOOP_SECURITY_CARD,
         "loop_checkpoint": schemas.LOOP_CHECKPOINT,
@@ -164,6 +168,55 @@ def register(ctx):
     # the model interpret "keep my tests green on X" directly, infer the repo,
     # detect the verify command and run the loop.
 
+    # Slash commands: let a user approve or inspect loop commands from chat,
+    # which is the only surface available when no gateway platform is connected.
+    try:
+        def _cmd_approve(raw_args):
+            """`/loop_approve <repo> <command...>` -- approve a loop command."""
+            text = (raw_args or "").strip().strip('"').strip("'")
+            if not text:
+                return ("Usage: /loop_approve <repo-path> <command...>\n"
+                        "Example: /loop_approve click .venv/Scripts/python.exe -m pytest -q")
+            parts = text.split(None, 1)
+            if len(parts) < 2:
+                return "Usage: /loop_approve <repo-path> <command...>"
+            repo, command = parts[0], parts[1]
+            out = tools.loop_approve({"repo_path": repo, "command": command})
+            try:
+                import json as _json
+                parsed = _json.loads(out)
+                return parsed.get("message") or parsed.get("error") or out
+            except Exception:
+                return out
+
+        def _cmd_pending(raw_args):
+            """`/loop_pending` -- show commands that still need approval."""
+            out = tools.loop_pending({})
+            try:
+                import json as _json
+                parsed = _json.loads(out)
+                pending = parsed.get("pending") or []
+                if not pending:
+                    return "No loop commands are waiting for approval."
+                lines = ["Loop commands waiting for approval:"]
+                for r in pending:
+                    lines.append("  %s (%s)" % (r.get("command"), r.get("purpose")))
+                    lines.append("    rule_key: %s" % r.get("rule_key"))
+                    lines.append("    repo: %s" % r.get("repo_path"))
+                lines.append("")
+                lines.append(parsed.get("how_to_approve", ""))
+                return "\n".join(lines)
+            except Exception:
+                return out
+
+        ctx.register_command("loop_approve", _cmd_approve,
+                             description="Approve a LoopRunner command for unattended runs",
+                             args_hint="<repo-path> <command...>")
+        ctx.register_command("loop_pending", _cmd_pending,
+                             description="List LoopRunner commands waiting for approval")
+    except Exception as e:
+        logger.warning("Could not register looprunner slash commands: %s", e)
+
     # Store ctx reference for tools that need LLM access
     tools.set_ctx(ctx)
 
@@ -181,4 +234,4 @@ def register(ctx):
     except Exception as e:
         logger.warning("Could not register bundled skill: %s", e)
 
-    logger.info("LoopRunner plugin loaded (18 tools, 3 hooks)")
+    logger.info("LoopRunner plugin loaded (20 tools, 3 hooks)")

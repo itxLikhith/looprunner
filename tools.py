@@ -825,6 +825,56 @@ def _finish_loop(loop, state, reason):
     return deleted
 
 
+def _rule_key_for(repo_path, command):
+    """Stable per-(repo, command) allowlist key, matching the pre_tool_call hook."""
+    return "looprunner:%s:%s" % (
+        hashlib.sha256(os.path.abspath(repo_path).encode("utf-8")).hexdigest()[:16],
+        hashlib.sha256(command.encode("utf-8")).hexdigest()[:16],
+    )
+
+
+def _approve_instruction(repo_path, command, purpose, surface=None):
+    """Human-readable instructions for approving a loop command out of band.
+
+    The loop cannot always reach a human (cron, headless, no connected
+    platform), so the refusal has to carry the exact steps to approve. Two
+    routes, both of which persist to ``command_allowlist`` and survive
+    restarts:
+
+    1. ``hermes approvals test -- <command>`` to see the current verdict.
+    2. Adding the rule to ``command_allowlist`` in config.yaml, or running the
+       loop from an interactive session and answering the prompt with ``always``.
+    """
+    key = _rule_key_for(repo_path, command)
+    lines = [
+        "How to approve this command:",
+        "",
+        "1. Check the current verdict (never executes anything):",
+        "     hermes approvals test -- %s" % command,
+        "",
+        "2. Then either:",
+        "   a. Run loop_start from an INTERACTIVE session and answer the",
+        "      approval prompt with [a]lways. The approval is remembered per",
+        "      (repository, command), so cron ticks then run it unattended.",
+        "   b. Or add this entry to command_allowlist in config.yaml:",
+        "     command_allowlist:",
+        "       - %s" % key,
+        "",
+    ]
+    if surface:
+        lines += [
+            "   c. Or, to allow unattended %s runs generally (broader):" % surface,
+            "     approvals:",
+            "       %s_mode: approve" % surface,
+            "",
+        ]
+    lines += [
+        "The rule key for this command is: %s" % key,
+        "Repository: %s" % repo_path,
+    ]
+    return "\n".join(lines)
+
+
 def escalate_loop_command(tool_name, args):
     """Escalate a loop's verify/goal command to Hermes's own approval gate.
 
@@ -935,16 +985,27 @@ def _approve_command(repo_path, command, purpose):
     if not command:
         return False, "no command"
 
+    # Already approved? The allowlist is the whole point of approving once per
+    # (repo, command) -- check it BEFORE the surface gate, so a command the
+    # operator approved out of band runs unattended as intended.
+    key = _rule_key_for(repo_path, command)
+    try:
+        from tools.approval import load_permanent_allowlist
+        if key in set(load_permanent_allowlist()):
+            return True, "already approved (command_allowlist)"
+    except Exception:
+        pass
+
     # No human can answer on these surfaces, and Hermes's own policy for them
     # is deny-by-default. Refuse now rather than blocking for the full timeout
-    # and failing closed anyway.
+    # and failing closed anyway -- but say exactly how to approve it.
     surface, mode = _surface_approval_mode()
     if surface and mode == "deny":
         return False, (
             "no human can answer an approval in a %s run and "
-            "approvals.%s_mode is 'deny'; refusing. Run loop_start from an "
-            "interactive session, or set approvals.%s_mode: approve."
-            % (surface, surface, surface)
+            "approvals.%s_mode is 'deny'; refusing.\n\n%s"
+            % (surface, surface,
+               _approve_instruction(repo_path, command, purpose, surface))
         )
 
     # Preferred path: hand the decision to Hermes's own gate via the public
@@ -2786,6 +2847,89 @@ def _plugin_settings():
     except Exception:
         return {}
     return cfg
+
+
+def loop_approve(args, **kwargs):
+    """Approve a loop command out of band, from chat.
+
+    Records the command's rule key in ``command_allowlist`` so cron and other
+    unattended runs may execute it. This is the explicit, operator-initiated
+    route: it only ever adds an entry the user asked for, and it reports the
+    exact rule key so the decision is auditable.
+    """
+    repo = (args.get("repo_path") or "").strip()
+    command = (args.get("command") or "").strip()
+    purpose = (args.get("purpose") or "verify").strip()
+    if not repo or not command:
+        return json.dumps({
+            "error": "repo_path and command are required",
+            "usage": "loop_approve(repo_path=..., command=..., purpose='verify'|'goal')",
+        })
+    resolved, err = _resolve_repo(repo)
+    if err or not resolved:
+        return _err(err or "could not resolve the repository path")
+
+    key = _rule_key_for(resolved, command)
+    try:
+        from tools.approval import load_permanent_allowlist, save_permanent_allowlist
+    except Exception as e:
+        return json.dumps({
+            "approved": False, "rule_key": key,
+            "error": "approval allowlist unavailable (%s); add the key to "
+                     "command_allowlist in config.yaml by hand" % e,
+            "rule_key_to_add": key,
+        })
+    try:
+        current = set(load_permanent_allowlist())
+        current.add(key)
+        save_permanent_allowlist(current)
+    except Exception as e:
+        return json.dumps({
+            "approved": False, "rule_key": key,
+            "error": "could not persist the allowlist (%s)" % e,
+            "rule_key_to_add": key,
+        })
+    return json.dumps({
+        "approved": True, "rule_key": key, "repo_path": resolved,
+        "command": command, "purpose": purpose,
+        "message": (
+            "Approved `%s` for %s. Unattended runs may now execute it. "
+            "Remove the entry from command_allowlist in config.yaml to "
+            "withdraw the approval." % (command, resolved)
+        ),
+    })
+
+
+def loop_pending(args, **kwargs):
+    """List loop commands that still need approval, with the exact steps."""
+    try:
+        state = _load_state()
+    except Exception:
+        state = {}
+    rows = []
+    for loop in (state.get("loops") or {}).values():
+        if loop.get("status") not in ("running", "paused", "stalled"):
+            continue
+        for purpose, key in (("verify", "verify_cmd"), ("goal", "goal_cmd")):
+            cmd = (loop.get(key) or "").strip()
+            if not cmd:
+                continue
+            approved = bool(loop.get("command_approved" if purpose == "verify"
+                                     else "goal_cmd_approved"))
+            rows.append({
+                "loop_id": loop["id"], "purpose": purpose, "command": cmd,
+                "approved": approved, "rule_key": _rule_key_for(loop["repo_path"], cmd),
+                "repo_path": loop["repo_path"],
+            })
+    return json.dumps({
+        "pending": [r for r in rows if not r["approved"]],
+        "approved": [r for r in rows if r["approved"]],
+        "how_to_approve": (
+            "Call loop_approve(repo_path=..., command=...), or add the rule_key "
+            "to command_allowlist in config.yaml, or run loop_start from an "
+            "interactive session and answer the prompt with [a]lways."
+        ),
+    })
 
 
 def loop_scan_issues(args, **kwargs):
