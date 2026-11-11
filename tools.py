@@ -485,6 +485,28 @@ def _cron_allowed():
     )
 
 
+def _cron_tick_can_verify():
+    """Whether a cron tick may run a verify command at all.
+
+    A cron tick has no human to approve anything. If the loop's command was
+    approved interactively (recorded at loop_start) the tick may run it --
+    that is the whole point of approving once per (repo, command). If it was
+    not, the tick must refuse immediately rather than block for the timeout:
+    ``approvals.cron_mode`` defaults to ``deny`` and the gate fails closed
+    anyway, so waiting only delays the same refusal.
+    """
+    surface, mode = _surface_approval_mode()
+    if surface != "cron":
+        return True, "not a cron run"
+    if mode == "approve":
+        return True, "approvals.cron_mode is 'approve'"
+    return False, (
+        "cron run with approvals.cron_mode='deny': refusing to run an "
+        "unapproved command. Start the loop from an interactive session so the "
+        "command can be approved once, or set approvals.cron_mode: approve."
+    )
+
+
 def _cron_create(argv, timeout=30):
     """Create a cron job through the CLI, honouring the agent-scheduling gate."""
     allowed, detail = _cron_allowed()
@@ -742,6 +764,35 @@ def _finish_loop(loop, state, reason):
     return deleted
 
 
+def _surface_approval_mode():
+    """Return ``(surface, mode)`` for the current process, or ``(None, None)``.
+
+    Hermes already decides what to do when no human can answer a prompt:
+    ``approvals.cron_mode`` / ``single_query_mode`` / ``unattended_mode``
+    (all default ``deny``). A loop that shells out from one of those surfaces
+    must not sit through the full approval timeout -- nobody is there, and the
+    gate fails closed anyway. Reading the mode lets us refuse immediately with
+    a useful message instead of hanging.
+
+    Returns ``(None, None)`` when the surface cannot be determined, in which
+    case the caller falls through to the normal gate.
+    """
+    try:
+        from tools import approval_context as ac
+    except Exception:
+        return None, None
+    try:
+        if ac._is_cron_approval_context():
+            return "cron", ac._get_cron_approval_mode()
+        if ac._is_single_query_approval_context():
+            return "single_query", ac._get_single_query_approval_mode()
+        if ac._is_unattended_platform_approval_context():
+            return "unattended", ac._get_unattended_approval_mode()
+    except Exception:
+        return None, None
+    return None, None
+
+
 def _approve_command(repo_path, command, purpose):
     """Ask the human to approve a verify/goal command once per (repo, command).
 
@@ -760,6 +811,19 @@ def _approve_command(repo_path, command, purpose):
     """
     if not command:
         return False, "no command"
+
+    # No human can answer on these surfaces, and Hermes's own policy for them
+    # is deny-by-default. Refuse now rather than blocking for the full timeout
+    # and failing closed anyway.
+    surface, mode = _surface_approval_mode()
+    if surface and mode == "deny":
+        return False, (
+            "no human can answer an approval in a %s run and "
+            "approvals.%s_mode is 'deny'; refusing. Run loop_start from an "
+            "interactive session, or set approvals.%s_mode: approve."
+            % (surface, surface, surface)
+        )
+
     rule_key = "looprunner:%s:%s" % (
         hashlib.sha256(os.path.abspath(repo_path).encode("utf-8")).hexdigest()[:16],
         hashlib.sha256(command.encode("utf-8")).hexdigest()[:16],
@@ -804,6 +868,13 @@ def _run_verify(loop):
     # A cron/headless run has no human to approve anything. Only a command the
     # user already approved (recorded at loop_start) may run here.
     if not loop.get("command_approved"):
+        can, why = _cron_tick_can_verify()
+        if not can:
+            return None, (
+                "refusing to run verify_cmd in a cron run: %s. The command was "
+                "never approved interactively. Start the loop from an "
+                "interactive session." % why
+            ), 0.0
         return None, (
             "refusing to run verify_cmd in an unattended run: it was never approved "
             "interactively. Start the loop from an interactive session."
