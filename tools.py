@@ -996,17 +996,61 @@ def _approve_command(repo_path, command, purpose):
     except Exception:
         pass
 
+    # A card may have been answered since the last tick. Check it before
+    # refusing, so the loop unblocks on the next run rather than the one after.
+    try:
+        state = _load_state()
+        for cand in (state.get("loops") or {}).values():
+            if cand.get("approval_card_id") and (cand.get("approval_card_for") or "") == command:
+                decision = _card_decision(cand["approval_card_id"])
+                if decision == "approve":
+                    ok, detail = _record_approval(repo_path, command)
+                    if ok:
+                        cand["command_approved"] = True
+                        cand["approval_card_id"] = None
+                        _save_state(state)
+                        return True, "approved via card %s" % cand.get("approval_card_id")
+                elif decision == "deny":
+                    return False, (
+                        "command explicitly denied on approval card %s; refusing. "
+                        "Approve it with loop_approve to re-enable."
+                        % cand["approval_card_id"])
+    except Exception:
+        pass
+
     # No human can answer on these surfaces, and Hermes's own policy for them
     # is deny-by-default. Refuse now rather than blocking for the full timeout
-    # and failing closed anyway -- but say exactly how to approve it.
+    # and failing closed anyway -- but say exactly how to approve it, and
+    # dispatch a card so there is somewhere to answer it.
     surface, mode = _surface_approval_mode()
     if surface and mode == "deny":
-        return False, (
+        card_id = None
+        try:
+            state = _load_state()
+            loop = None
+            for cand in (state.get("loops") or {}).values():
+                if (cand.get("status") in ("running", "paused")
+                        and (cand.get("verify_cmd") or "").strip() == command):
+                    loop = cand
+                    break
+            if loop and not loop.get("approval_card_id"):
+                card_id, _raw = _create_approval_card(loop, command, purpose, surface)
+                if card_id:
+                    loop["approval_card_id"] = card_id
+                    loop["approval_card_for"] = command
+                    _save_state(state)
+        except Exception:
+            card_id = None
+        detail = (
             "no human can answer an approval in a %s run and "
             "approvals.%s_mode is 'deny'; refusing.\n\n%s"
             % (surface, surface,
                _approve_instruction(repo_path, command, purpose, surface))
         )
+        if card_id:
+            detail += ("\n\nAn approval card was dispatched: %s "
+                       "(comment \"approve\" or \"deny\")." % card_id)
+        return False, detail
 
     # Preferred path: hand the decision to Hermes's own gate via the public
     # pre_tool_call hook surface (the same mechanism a user-defined dangerous
@@ -2618,6 +2662,111 @@ def _create_autofix_card(loop, output, sig, attempts):
         goal_max_turns=loop.get("goal_max_turns", 20),
         skills=["looprunner-pattern"],
     )
+
+
+def _create_approval_card(loop, command, purpose, surface):
+    """Ask a human to approve a loop command via a kanban card.
+
+    This is the delivery target for approval prompts when no gateway platform
+    is connected: the card lands on the board the user already checks for
+    stalled loops, and answering it records a standing approval in
+    ``command_allowlist`` -- the same persistence ``/loop_approve`` uses.
+
+    The card is explicit that approving is a STANDING grant, not a one-off.
+    """
+    key = _rule_key_for(loop["repo_path"], command)
+    # The card id is only known after creation, so the body carries a
+    # placeholder that is filled in once the card exists.
+    body = (
+        "LoopRunner loop %s needs approval to run a command that no human could "
+        "be asked about (a %s run).\n\n"
+        "Repository: %s\n"
+        "Command (%s): %s\n"
+        "Rule key: %s\n\n"
+        "**Approving is a standing grant.** It allows this command to run "
+        "unattended in this repository on every loop tick, including cron. "
+        "It is scoped to this exact command in this exact repository.\n\n"
+        "How to decide:\n"
+        "1. Check the command is what you expect for this repository.\n"
+        "2. Check the current verdict without running anything:\n"
+        "     hermes approvals test -- %s\n"
+        "3. Then either approve or deny.\n\n"
+        "How to approve:\n"
+        "  hermes kanban comment @CARD@ approve\n"
+        "or call the loop_approve tool:\n"
+        "  loop_approve(repo_path=%s, command=%s)\n\n"
+        "How to deny:\n"
+        "  hermes kanban comment @CARD@ deny\n"
+        "A denial blocks the command for this loop; the loop will not retry it "
+        "until you approve.\n\n"
+        "The card can also be answered from chat with /loop_approve."
+        % (loop["id"], surface, loop["repo_path"], purpose, command, key,
+           command, loop["repo_path"], command)
+    )
+    card_id, raw = _kanban_create(
+        "Approve loop command: %s" % command[:60],
+        body,
+        assignee=loop.get("assignee"),
+        goal=True,
+        goal_max_turns=loop.get("goal_max_turns", 20),
+        skills=["looprunner-pattern"],
+    )
+    if card_id and "@CARD@" in body:
+        try:
+            _kanban(["edit", card_id, "--body", body.replace("@CARD@", card_id)])
+        except Exception:
+            pass
+    return card_id, raw
+
+
+def _card_decision(card_id):
+    """Read an approval decision recorded as a card comment.
+
+    Returns ``"approve"``, ``"deny"`` or ``None``. Only an explicit,
+    case-insensitive ``approve``/``deny`` at the start of a comment counts --
+    anything else is ignored so a discussion on the card cannot silently grant
+    a standing approval.
+    """
+    if not card_id:
+        return None
+    try:
+        rc, out = _kanban(["show", card_id, "--json"])
+    except Exception:
+        return None
+    if rc != 0 or not out.strip():
+        return None
+    try:
+        data = json.loads(out)
+    except Exception:
+        return None
+    comments = (data.get("comments") or data.get("events") or [])
+    if isinstance(comments, dict):
+        comments = comments.get("items") or []
+    for c in comments:
+        text = ""
+        if isinstance(c, dict):
+            text = c.get("body") or c.get("text") or c.get("content") or ""
+        elif isinstance(c, str):
+            text = c
+        text = str(text).strip().lower()
+        if text.startswith("approve"):
+            return "approve"
+        if text.startswith("deny"):
+            return "deny"
+    return None
+
+
+def _record_approval(repo_path, command):
+    """Persist an approved rule key to ``command_allowlist``."""
+    key = _rule_key_for(repo_path, command)
+    try:
+        from tools.approval import load_permanent_allowlist, save_permanent_allowlist
+        current = set(load_permanent_allowlist())
+        current.add(key)
+        save_permanent_allowlist(current)
+        return True, key
+    except Exception as e:
+        return False, "%s (add %s to command_allowlist by hand)" % (e, key)
 
 
 def _ensure_retry_cron(loop, state):
