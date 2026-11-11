@@ -1,5 +1,5 @@
 name: looprunner
-version: "0.13.0"
+version: "0.15.0"
 description: >-
   Set-and-forget autonomous QA loop runner for any repo: runs your verify command,
   diagnoses failures with the host LLM, fixes the source on a branch, opens a PR,
@@ -89,3 +89,10 @@ config_schema:
     type: int
     default: 20
     description: "Turn budget for goal-mode kanban cards"
+  issue_author_allowlist:
+    type: list
+    default: []
+    description: >-
+      GitHub logins allowed to trigger issue cards, in addition to repository
+      collaborators. Issue text is attacker-controlled; the default is
+      collaborators-only.
