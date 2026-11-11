@@ -390,16 +390,69 @@ def _run(argv, cwd=None, timeout=60, env=None):
         return 127, "command error: %s" % e
 
 
-def _minimal_env(extra=None):
-    """A minimal environment for subprocesses.
+# Core's own credential policy, mirrored here so a loop's subprocesses get the
+# same treatment as a sandboxed code-execution child:
+#   tools/code_execution_env.py::_SAFE_ENV_PREFIXES / _SECRET_SUBSTRINGS /
+#   _WINDOWS_ESSENTIAL_ENV_VARS
+#
+# Order matters: the secret-substring block runs FIRST, then whatever survives
+# must match a safe prefix or an OS-essential name. "PASS" is deliberately not
+# a substring -- it false-positives on BYPASS_CACHE / COMPASS_DIR / PASSENGER_HOST.
+_SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
+                      "PASSWD", "AUTH", "DSN", "WEBHOOK", "CREDS", "BEARER",
+                      "APIKEY", "COOKIE")
+_SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM", "TMPDIR",
+                      "TMP", "TEMP", "SHELL", "LOGNAME", "XDG_", "PYTHONPATH",
+                      "VIRTUAL_ENV", "CONDA")
+# Core deliberately does NOT treat these prefixes as safe: the broad HERMES_
+# prefix leaked config vars with no secret substring (HERMES_BASE_URL,
+# HERMES_KANBAN_DB, *_WEBHOOK), and TERMINAL_* describes the host's own
+# terminal backend, which a repo subprocess has no business reading.
+_UNSAFE_PREFIXES = ("HERMES_", "TERMINAL_")
+# Non-secret runtime-location flags a child may read at import time.
+_HERMES_CHILD_ALLOWED = frozenset({
+    "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+})
+_WINDOWS_ESSENTIAL = frozenset({
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "PUBLIC", "ALLUSERSPROFILE",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432",
+    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "USERDOMAIN", "USERNAME",
+    "HOMEDRIVE", "HOMEPATH", "COMPUTERNAME",
+})
 
-    Starts from PATH/HOME/LANG (and their Windows equivalents) and adds only what
-    the caller declares, so no provider credential leaks into repo code.
+
+def _is_secret_env_name(name):
+    return any(s in name.upper() for s in _SECRET_SUBSTRINGS)
+
+
+def _minimal_env(extra=None):
+    """A minimal environment for subprocesses, matching core's scrub policy.
+
+    Starts from the host environment, drops anything whose NAME looks like a
+    credential, then keeps only safe prefixes plus OS-essential Windows names.
+    The caller may add specific keys via ``extra`` (git/gh auth, venv paths).
+
+    Core does the same for sandboxed children; a loop runs repo test code,
+    ``gh``, ``git`` and ``hermes``, so it must not inherit provider API keys.
     """
-    keys = ["PATH", "HOME", "LANG", "LC_ALL", "SystemRoot", "TEMP", "TMP",
-            "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PATHEXT", "COMSPEC",
-            "PYTHONIOENCODING", "PYTHONUTF8", "GIT_CONFIG_NOSYSTEM"]
-    env = {k: os.environ[k] for k in keys if os.environ.get(k)}
+    env = {}
+    for k, v in os.environ.items():
+        if not k or v is None:
+            continue
+        if _is_secret_env_name(k):
+            continue
+        if k.upper().startswith(_UNSAFE_PREFIXES):
+            # HERMES_* is dropped unless explicitly allowlisted; TERMINAL_*
+            # describes the host's terminal backend, not the repo.
+            if k.upper() not in _HERMES_CHILD_ALLOWED:
+                continue
+        if k in _WINDOWS_ESSENTIAL or k.upper() in _WINDOWS_ESSENTIAL:
+            env[k] = v
+            continue
+        if any(k.upper().startswith(p) for p in _SAFE_ENV_PREFIXES):
+            env[k] = v
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
     if extra:
